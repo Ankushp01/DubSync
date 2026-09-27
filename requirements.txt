@@ -1,0 +1,3 @@
+# Stage 1 runtime dependency. Faster-Whisper downloads the selected model on
+# first use unless `model_path` points at an already-downloaded local model.
+faster-whisper>=1.1.0,<2.0.0

@@ -1,0 +1,4 @@
+# Stage 1 GPU runtime for Windows. Install this after requirements.txt.
+# These are NVIDIA runtime wheels, not the full CUDA Toolkit or a display driver.
+nvidia-cublas-cu12==12.9.1.4; sys_platform == "win32" and platform_machine == "AMD64"
+nvidia-cudnn-cu12==8.9.7.29; sys_platform == "win32" and platform_machine == "AMD64"

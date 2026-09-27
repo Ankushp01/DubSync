@@ -1,0 +1,40 @@
+# Local machine settings. This file is ignored by git.
+
+[paths]
+output_dir = "output"
+model_dir = "models"
+
+[runtime]
+device = "cuda"
+compute_type = "int8_float16"
+
+[ffmpeg]
+executable = "C:\\Tools\\ffmpeg\\bin\\ffmpeg.exe"
+
+[audio]
+sample_rate = 16000
+channels = 1
+
+[whisper]
+model_name = "small"
+model_path = ""
+language = ""
+beam_size = 3
+vad_filter = true
+
+[segmentation]
+max_gap_seconds = 0.75
+max_characters = 280
+min_duration_seconds = 3.0
+preferred_max_duration_seconds = 12.0
+hard_max_duration_seconds = 18.0
+
+[translation]
+model_name = "ai4bharat/indictrans2-en-indic-dist-200M"
+source_language = "eng_Latn"
+target_language = "hin_Deva"
+
+[tts]
+model_dir = "C:/Users/ankus/.cache/huggingface/hub/models--ResembleAI--chatterbox/snapshots/5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18"
+language_id = "hi"
+device = "cuda"
