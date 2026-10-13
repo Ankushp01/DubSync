@@ -24,10 +24,12 @@ vad_filter = true
 
 [segmentation]
 max_gap_seconds = 0.75
-max_characters = 280
-min_duration_seconds = 3.0
-preferred_max_duration_seconds = 12.0
-hard_max_duration_seconds = 18.0
+max_characters = 400
+preferred_min_duration_seconds = 8.0
+preferred_max_duration_seconds = 10.0
+hard_max_duration_seconds = 12.0
+meaningful_pause_seconds = 0.75
+min_duration_seconds = 8.0
 
 [translation]
 model_name = "ai4bharat/indictrans2-en-indic-dist-200M"

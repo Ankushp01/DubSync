@@ -15,13 +15,16 @@ import torchaudio
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 from dubsync.timing.duration import (
+    HARD_MAX_TTS_AUDIO_SECONDS,
+    MAX_TTS_AUDIO_SECONDS,
     duration_error,
     duration_error_ratio,
     get_audio_duration,
     is_acceptable,
+    validate_tts_duration,
 )
-from dubsync.timing.gemini_adapter import (
-    GeminiDurationAdapter,
+from dubsync.timing.text_adapter import (
+    TextDurationAdapter,
 )
 
 
@@ -356,11 +359,12 @@ def run_stage3(
     model_dir: str | Path | None = None,
     language_id: str = "hi",
     device: str = "cuda",
+    speech_speed: float = 1.0,
     ffmpeg_executable: str = "ffmpeg",
     enable_gemini_adaptation: bool = True,
     max_gemini_attempts: int = 2,
-    timing_tolerance: float = 0.75,
-    final_stretch_limit: float = 0.15,
+    timing_tolerance: float = 0.25,
+    final_stretch_limit: float = 0.25,
 ) -> Path:
     """
     Generate TTS audio for every Stage 2 dialogue segment.
@@ -449,27 +453,11 @@ def run_stage3(
     )
 
     # ---------------------------------------------------------
-    # Load Gemini only if enabled
+    # Load Duration Adapter (Gemini + Local Heuristics)
     # ---------------------------------------------------------
 
-    gemini = None
-
-    if enable_gemini_adaptation:
-
-        try:
-
-            gemini = GeminiDurationAdapter()
-
-            print(
-                "Gemini duration adaptation enabled."
-            )
-
-        except Exception as exc:
-
-            print(
-                "WARNING: Gemini duration adaptation "
-                f"disabled: {exc}"
-            )
+    text_adapter = TextDurationAdapter()
+    print("Duration text adaptation engine initialized.")
 
     output_dir.mkdir(
         parents=True,
@@ -534,9 +522,11 @@ def run_stage3(
             f"Translation: {current_text}"
         )
 
+        effective_target = target_duration / max(0.5, speech_speed)
+
         print(
             f"Target duration: "
-            f"{target_duration:.2f} seconds"
+            f"{target_duration:.2f} seconds (effective with speech_speed {speech_speed}x: {effective_target:.2f}s)"
         )
 
         # -----------------------------------------------------
@@ -569,55 +559,61 @@ def run_stage3(
 
         gemini_attempts = 0
         adapted = False
+        effective_tolerance = max(0.20, effective_target * 0.15)
 
         # -----------------------------------------------------
-        # Gemini adaptation loop
+        # Duration Text Adaptation Loop
+        # Trigger when TTS duration exceeds effective target by > 15%
         # -----------------------------------------------------
 
         while (
-            gemini is not None
-            and not is_acceptable(
-                generated_duration,
-                target_duration,
-                timing_tolerance,
+            (
+                generated_duration > effective_target * 1.25
+                or generated_duration > HARD_MAX_TTS_AUDIO_SECONDS
             )
             and gemini_attempts < max_gemini_attempts
         ):
-
             gemini_attempts += 1
 
             print("\n" + "-" * 70)
-
             print(
-                f"Gemini adaptation "
+                f"Duration text adaptation "
                 f"{gemini_attempts}/"
                 f"{max_gemini_attempts}"
             )
-
             print(
                 f"Current duration: "
                 f"{generated_duration:.2f}s"
             )
-
             print(
-                f"Target duration: "
-                f"{target_duration:.2f}s"
+                f"Effective target duration: "
+                f"{effective_target:.2f}s"
             )
 
             # -------------------------------------------------
-            # Ask Gemini to rewrite the text.
+            # Ask TextDurationAdapter to rewrite the text.
             # -------------------------------------------------
 
-            revised_text = gemini.adapt(
+            revised_text = text_adapter.adapt(
                 source_text=source_text,
                 translated_text=current_text,
-                target_duration=target_duration,
+                target_duration=effective_target,
                 generated_duration=generated_duration,
                 target_language="Hindi",
+                attempt=gemini_attempts,
             )
 
+            if revised_text == current_text:
+                print("Text adaptation produced identical text, stopping loop.")
+                break
+
+            # Safety check: ensure adaptation does not discard spoken content (>30% word drop)
+            if len(revised_text.split()) < max(3, int(len(original_text.split()) * 0.70)):
+                print("Adapted text dropped more than 30% of words. Rejecting adaptation to preserve spoken content.")
+                break
+
             print(
-                f"Gemini revised text:\n"
+                f"Adapted text:\n"
                 f"{revised_text}"
             )
 
@@ -653,23 +649,20 @@ def run_stage3(
             )
 
         # -----------------------------------------------------
-        # Final duration correction
+        # Final mild duration correction (only if small difference)
         # -----------------------------------------------------
 
         duration_error = (
             generated_duration
-            - target_duration
+            - effective_target
         )
 
         duration_ratio = (
-            duration_error / target_duration
-            if target_duration > 0
+            duration_error / effective_target
+            if effective_target > 0
             else 0.0
         )
 
-        # Only use time-stretch when the remaining error is
-        # reasonably small. We do NOT want to stretch something
-        # like 5.6s -> 11s.
         stretch_ratio = abs(
             duration_ratio
         )
@@ -680,8 +673,8 @@ def run_stage3(
         if (
             not is_acceptable(
                 generated_duration,
-                target_duration,
-                timing_tolerance,
+                effective_target,
+                effective_tolerance,
             )
             and stretch_ratio <= final_stretch_limit
         ):
@@ -694,7 +687,7 @@ def run_stage3(
             final_duration = time_stretch_to_target(
                 output_file,
                 corrected_file,
-                target_duration,
+                effective_target,
                 ffmpeg_executable=ffmpeg_executable,
             )
 
@@ -762,6 +755,13 @@ def run_stage3(
             f"{time_stretched}"
         )
 
+        is_valid_dur, validation_msg = validate_tts_duration(final_duration)
+
+        print(
+            f"TTS validation: "
+            f"{validation_msg}"
+        )
+
         print(
             f"Generation time: "
             f"{generation_time:.2f} seconds"
@@ -778,6 +778,9 @@ def run_stage3(
                 "end": end,
 
                 "target_duration": target_duration,
+                "effective_target_duration": effective_target,
+                "speech_speed": speech_speed,
+                "tts_validation": validation_msg,
 
                 "original_translated_text": (
                     original_text
@@ -789,6 +792,9 @@ def run_stage3(
 
                 "text_was_adapted": adapted,
 
+                "adaptation_attempts": (
+                    gemini_attempts
+                ),
                 "gemini_attempts": (
                     gemini_attempts
                 ),
@@ -865,8 +871,8 @@ def run_stage3(
         ),
         "duration_adapter": (
             "Gemini"
-            if gemini is not None
-            else None
+            if text_adapter.client is not None
+            else "TextDurationAdapter"
         ),
         "timing_units": "seconds",
         "segments": results,

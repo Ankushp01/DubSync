@@ -46,6 +46,8 @@ Wav2Lip-HD/
 input/
 output/
 test/
+jobs/
+
 
 *.mp4
 *.mkv

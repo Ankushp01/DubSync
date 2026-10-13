@@ -10,9 +10,17 @@ class TimedText:
     start: float
     end: float
     text: str
+    speaker: str | None = None
 
     def to_dict(self) -> dict[str, float | str]:
-        return asdict(self)
+        data = {
+            "start": self.start,
+            "end": self.end,
+            "text": self.text,
+        }
+        if self.speaker is not None:
+            data["speaker"] = self.speaker
+        return data
 
 
 @dataclass(frozen=True)

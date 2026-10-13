@@ -157,6 +157,7 @@ def run_stage3(
     stage2_path: str | Path,
     config: AppConfig,
     reference_audio: str | Path | None = None,
+    speech_speed: float = 1.0,
 ) -> Path:
     """Run Chatterbox Stage 3 in the dedicated .tts-venv."""
 
@@ -181,7 +182,6 @@ def run_stage3(
 
     output_dir = stage2_file.parent
 
-
     payload = {
         "stage2_path": str(stage2_file),
         "output_dir": str(output_dir),
@@ -193,6 +193,7 @@ def run_stage3(
         "model_dir": str(config.tts.model_dir),
         "language_id": config.tts.language_id,
         "device": config.tts.device,
+        "speech_speed": speech_speed,
         "ffmpeg_executable": config.ffmpeg.executable,
         "enable_gemini_adaptation": True,
         "max_gemini_attempts": 2,
@@ -248,9 +249,10 @@ def run_stage3(
 def run_stage4(
     stage3_path: str | Path,
     output_dir: str | Path,
+    source_audio_path: str | Path | None = None,
 ) -> Path:
     """
-    Assemble Stage 3 TTS segments into one timeline-aligned WAV.
+    Assemble Stage 3 TTS segments into one timeline-aligned WAV with duration adaptation.
     """
 
     stage3_path = Path(stage3_path).resolve()
@@ -265,6 +267,7 @@ def run_stage4(
     return assemble_stage3_audio(
         stage3_path=stage3_path,
         output_path=output_path,
+        source_audio_path=source_audio_path,
     )
 
 def run_stage5(
@@ -288,6 +291,31 @@ def run_stage5(
         ffmpeg_executable=ffmpeg_executable,
     )
 
+def run_stage6(
+    video_path: str | Path,
+    dubbed_audio_path: str | Path,
+    output_dir: str | Path,
+    progress_callback = None,
+    resize_factor: int = 1,
+) -> Path:
+    """Run Stage 6 Wav2Lip-HD neural lip synchronization."""
+    from dubsync.lipsync.wav2lip import run_wav2lip_hd
+
+    output_dir = Path(output_dir).resolve()
+    output_path = (
+        output_dir
+        / "video"
+        / "dubbed_video_wav2lip.mp4"
+    )
+
+    return run_wav2lip_hd(
+        video_path=video_path,
+        audio_path=dubbed_audio_path,
+        output_path=output_path,
+        progress_callback=progress_callback,
+        resize_factor=resize_factor,
+    )
+
 def _write_stage1(
     path: Path,
     transcript: Transcript,
@@ -297,9 +325,10 @@ def _write_stage1(
         transcript.segments,
         max_gap_seconds=config.segmentation.max_gap_seconds,
         max_characters=config.segmentation.max_characters,
-        min_duration_seconds=config.segmentation.min_duration_seconds,
+        preferred_min_duration_seconds=config.segmentation.preferred_min_duration_seconds,
         preferred_max_duration_seconds=config.segmentation.preferred_max_duration_seconds,
         hard_max_duration_seconds=config.segmentation.hard_max_duration_seconds,
+        meaningful_pause_seconds=config.segmentation.meaningful_pause_seconds,
     )
 
     payload = {

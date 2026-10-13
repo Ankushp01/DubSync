@@ -69,6 +69,19 @@ class IndicTrans2Translator:
             "target_language": self.target_language,
         }
 
+        import os
+        env = os.environ.copy()
+        pythonpath = [
+            str(PROJECT_ROOT),
+            str(PROJECT_ROOT / "IndicTrans2"),
+            str(PROJECT_ROOT / "IndicTrans2" / "IndicTransToolkit"),
+        ]
+        if "PYTHONPATH" in env:
+            pythonpath.append(env["PYTHONPATH"])
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+
         process = subprocess.run(
             [
                 str(INDICTRANS_PYTHON),
@@ -81,6 +94,7 @@ class IndicTrans2Translator:
             text=True,
             capture_output=True,
             encoding="utf-8",
+            env=env,
         )
 
         if process.returncode != 0:

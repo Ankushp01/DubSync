@@ -100,25 +100,26 @@ def main():
     if operation == "stage3":
 
         manifest_path = run_stage3(
-        stage2_path=payload["stage2_path"],
-        output_dir=payload["output_dir"],
-        reference_audio=payload.get("reference_audio"),
-        model_dir=payload.get("model_dir"),
-        language_id=payload["language_id"],
-        device=payload["device"],
-        ffmpeg_executable=payload.get(
-            "ffmpeg_executable",
-            "ffmpeg",
-        ),
-        enable_gemini_adaptation=payload.get(
-            "enable_gemini_adaptation",
-            True,
-        ),
-        max_gemini_attempts=payload.get(
-            "max_gemini_attempts",
-            2,
-        ),
-    )
+            stage2_path=payload["stage2_path"],
+            output_dir=payload["output_dir"],
+            reference_audio=payload.get("reference_audio"),
+            model_dir=payload.get("model_dir"),
+            language_id=payload["language_id"],
+            device=payload["device"],
+            speech_speed=payload.get("speech_speed", 1.0),
+            ffmpeg_executable=payload.get(
+                "ffmpeg_executable",
+                "ffmpeg",
+            ),
+            enable_gemini_adaptation=payload.get(
+                "enable_gemini_adaptation",
+                True,
+            ),
+            max_gemini_attempts=payload.get(
+                "max_gemini_attempts",
+                2,
+            ),
+        )
 
         json.dump(
             {

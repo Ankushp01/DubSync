@@ -25,9 +25,24 @@ if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
 
 
+import os
+from pathlib import Path
+
 MODEL_NAME = (
     "ai4bharat/indictrans2-en-indic-dist-200M"
 )
+
+
+def _resolve_indictrans_model_source() -> tuple[str, bool]:
+    """Find local cached snapshot of IndicTrans2 to prevent network stalls."""
+    cache_dir = Path(os.getenv("HF_HOME", Path.home() / ".cache" / "huggingface" / "hub"))
+    repo_folder = "models--" + MODEL_NAME.replace("/", "--")
+    snapshots_dir = cache_dir / repo_folder / "snapshots"
+    if snapshots_dir.is_dir():
+        for s in sorted(list(snapshots_dir.iterdir()), key=lambda p: p.stat().st_mtime, reverse=True):
+            if s.is_dir() and (s / "config.json").exists() and (s / "model.safetensors").exists():
+                return str(s), True
+    return MODEL_NAME, False
 
 
 def load_model():
@@ -39,8 +54,10 @@ def load_model():
         else "cpu"
     )
 
+    model_source, local_files_only = _resolve_indictrans_model_source()
+
     print(
-        f"Loading IndicTrans2: {MODEL_NAME}",
+        f"Loading IndicTrans2: {model_source} (local_files_only={local_files_only})",
         file=sys.stderr,
     )
 
@@ -50,13 +67,15 @@ def load_model():
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
+        model_source,
         trust_remote_code=True,
+        local_files_only=local_files_only,
     )
 
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME,
+        model_source,
         trust_remote_code=True,
+        local_files_only=local_files_only,
         torch_dtype=(
             torch.float16
             if device == "cuda"

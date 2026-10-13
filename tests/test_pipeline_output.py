@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dubsync.config import (
     AppConfig, AudioConfig, FfmpegConfig, PathsConfig, RuntimeConfig,
-    SegmentationConfig, WhisperConfig,
+    SegmentationConfig, WhisperConfig, TranslationConfig, TTSConfig,
 )
 from dubsync.models import TimedText, Transcript
 from dubsync.pipeline import _write_stage1
@@ -18,6 +18,8 @@ def make_config(root: Path) -> AppConfig:
         audio=AudioConfig(16000, 1),
         whisper=WhisperConfig("base", "", None, 1, False),
         segmentation=SegmentationConfig(0.75, 280),
+        translation=TranslationConfig("dummy", "eng_Latn", "hin_Deva"),
+        tts=TTSConfig("dummy", "hi", "cpu"),
     )
 
 

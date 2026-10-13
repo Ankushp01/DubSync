@@ -60,3 +60,28 @@ def is_acceptable(
     return abs(
         generated_duration - target_duration
     ) <= tolerance_seconds
+
+
+MAX_TTS_AUDIO_SECONDS = 10.0
+HARD_MAX_TTS_AUDIO_SECONDS = 12.0
+
+
+def validate_tts_duration(
+    duration: float,
+    max_duration: float = MAX_TTS_AUDIO_SECONDS,
+    hard_max_duration: float = HARD_MAX_TTS_AUDIO_SECONDS,
+) -> tuple[bool, str]:
+    """Validate TTS audio duration against generation safety ceilings."""
+    if duration <= 0:
+        return False, "Audio duration must be greater than zero."
+    if duration > hard_max_duration:
+        return (
+            False,
+            f"TTS duration ({duration:.2f}s) exceeded hard maximum safety ceiling ({hard_max_duration:.2f}s).",
+        )
+    if duration > max_duration:
+        return (
+            True,
+            f"TTS duration ({duration:.2f}s) exceeds preferred max ({max_duration:.2f}s) but is within hard ceiling ({hard_max_duration:.2f}s).",
+        )
+    return True, f"TTS duration ({duration:.2f}s) is within preferred limit ({max_duration:.2f}s)."

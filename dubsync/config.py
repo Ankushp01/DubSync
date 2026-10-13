@@ -41,11 +41,36 @@ class WhisperConfig:
 
 @dataclass
 class SegmentationConfig:
-    max_gap_seconds: float
-    max_characters: int
-    min_duration_seconds: float
-    preferred_max_duration_seconds: float
-    hard_max_duration_seconds: float
+    max_gap_seconds: float = 0.75
+    max_characters: int = 400
+    preferred_min_duration_seconds: float = 8.0
+    preferred_max_duration_seconds: float = 10.0
+    hard_max_duration_seconds: float = 12.0
+    meaningful_pause_seconds: float = 0.75
+    min_duration_seconds: float = 8.0
+
+    def __init__(
+        self,
+        max_gap_seconds: float = 0.75,
+        max_characters: int = 400,
+        preferred_min_duration_seconds: float = 8.0,
+        preferred_max_duration_seconds: float = 10.0,
+        hard_max_duration_seconds: float = 12.0,
+        meaningful_pause_seconds: float = 0.75,
+        min_duration_seconds: float | None = None,
+        **kwargs,
+    ):
+        self.max_gap_seconds = max_gap_seconds
+        self.max_characters = max_characters
+        self.preferred_min_duration_seconds = preferred_min_duration_seconds
+        self.preferred_max_duration_seconds = preferred_max_duration_seconds
+        self.hard_max_duration_seconds = hard_max_duration_seconds
+        self.meaningful_pause_seconds = meaningful_pause_seconds
+        self.min_duration_seconds = (
+            min_duration_seconds
+            if min_duration_seconds is not None
+            else preferred_min_duration_seconds
+        )
 
 @dataclass(frozen=True)
 class TranslationConfig:
