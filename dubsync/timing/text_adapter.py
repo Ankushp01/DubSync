@@ -30,26 +30,65 @@ HINDI_IDIOM_PATTERNS = [
     ),
 ]
 
+
+def _devanagari_sub(pattern: str, replacement: str, text: str) -> str:
+    """Safely replace words/phrases in Devanagari text respecting Unicode word boundaries.
+
+    Standard Python regex '\\b' fails on Devanagari words ending with vowel signs
+    (matras like ो, े, ा, ी, ु) or anusvara (ं), because Unicode combining marks (Mn)
+    are classified as \\W.
+    """
+    regex = r"(?:(?<=[\s,।?!;:\-\"\'\(\)])|^)" + pattern + r"(?:(?=[\s,।?!;:\-\"\'\(\)])|$)"
+    return re.sub(regex, replacement, text)
+
+
+# Literal/verbose phrase simplifications that preserve full meaning in concise conversational Hindi
+HINDI_CONVERSATIONAL_SIMPLIFICATIONS = [
+    # Idiomatic calming nerves (calm your nerves -> calm anxiety/fear, not anatomical nerves)
+    (r"आपकी नसों को शांत", "आपकी घबराहट शांत"),
+    (r"नसों को शांत", "घबराहट शांत"),
+    # Pretend like it's going to just one person -> assume it's only for that person
+    (r"ऐसा नाटक करते हैं कि यह केवल एक व्यक्ति के लिए जा रहा है", "मान लें कि यह केवल उसी के लिए है,"),
+    (r"ऐसा नाटक करते हैं कि यह सिर्फ एक व्यक्ति के लिए जा रहा है", "मान लें कि यह केवल उसी के लिए है,"),
+    (r"ऐसा नाटक करते हैं कि", "मान लें कि"),
+    (r"केवल एक व्यक्ति के लिए जा रहा है", "केवल उसी के लिए है"),
+    (r"सिर्फ एक व्यक्ति के लिए जा रहा है", "सिर्फ उसी के लिए है"),
+    (r"एक व्यक्ति के लिए जा रहा है", "उसी के लिए है"),
+    # Focus down -> focus (conversational)
+    (r"ध्यान केंद्रित करते हैं", "ध्यान दें"),
+    (r"ध्यान केंद्रित करें", "ध्यान दें"),
+    (r"ध्यान केंद्रित करने", "ध्यान देने"),
+    # Help you feel more -> make you feel better
+    (r"शांत कर सकता है और", "शांत कर"),
+    (r"अधिक महसूस करने में मदद कर सकता है", "बेहतर महसूस कराएगा"),
+    (r"महसूस करने में मदद कर सकता है", "बेहतर महसूस कराएगा"),
+    (r"करने में मदद कर सकता है", "करा सकता है"),
+    (r"करने की आवश्यकता नहीं है", "की जरूरत नहीं"),
+    (r"होने की आवश्यकता नहीं है", "होना जरूरी नहीं"),
+]
+
 # Filler and redundant word patterns for Hindi spoken dialogue
 HINDI_REDUNDANCIES = [
-    (r"\bलेकिन मैंने\b", "पर"),
-    (r"\bलेकिन\b", "पर"),
-    (r"\bपरन्तु\b", "पर"),
-    (r"\bकिन्तु\b", "पर"),
-    (r"\bइस बातचीत में\b", ""),
-    (r"\bके बारे में\b", "पर"),
-    (r"\bजा रहा था\b", "था"),
-    (r"\bकरने जा रहा था\b", "करने वाला था"),
-    (r"\bउसे बाहर निकालने\b", "उससे पूछने"),
+    (r"लेकिन मैंने", "पर"),
+    (r"लेकिन", "पर"),
+    (r"परन्तु", "पर"),
+    (r"किन्तु", "पर"),
+    (r"इस बातचीत में", ""),
+    (r"के बारे में", "पर"),
+    (r"जा रहा था", "था"),
+    (r"करने जा रहा था", "करने वाला था"),
+    (r"उसे बाहर निकालने", "उससे पूछने"),
 ]
 
 
 # Conversational filler phrases that can be safely simplified to shorten spoken duration
 HINDI_CONVERSATIONAL_FILLERS = [
-    (r"\bआप जानते हैं[?,]?\b", ""),
-    (r"\bवास्तव में\b", ""),
-    (r"\bबस\b", ""),
-    (r"\bतो फिर\b", "तो"),
+    (r"आप जानते हैं[?,]?", ""),
+    (r"वास्तव में", ""),
+    (r"बस", ""),
+    (r"तो फिर", "तो"),
+    (r"यह तथ्य कि", "यह कि"),
+    (r"इस तथ्य कि", "यह कि"),
 ]
 
 
@@ -86,6 +125,13 @@ class TextDurationAdapter:
         if target_duration <= 0 or generated_duration <= 0:
             return translated_text
 
+        # Dynamic content safety threshold:
+        # Allow proportional word reduction based on target duration (min 50%),
+        # while strictly preventing destructive phrase slicing (e.g. 5-word broken fragments).
+        target_ratio = target_duration / max(0.1, generated_duration)
+        min_allowed_ratio = max(0.50, min(0.70, target_ratio * 0.95))
+        min_words = max(3, int(len(translated_text.split()) * min_allowed_ratio))
+
         # Try Gemini API if available
         if self.client is not None:
             try:
@@ -97,15 +143,14 @@ class TextDurationAdapter:
                     target_language=target_language,
                     attempt=attempt,
                 )
-                # Verify adapted text does not discard more than 30% of content
-                if len(adapted.split()) >= max(3, int(len(translated_text.split()) * 0.70)):
+                if len(adapted.split()) >= min_words:
                     return adapted
                 logger.warning("Gemini adaptation dropped too much content. Falling back to local adaptation.")
             except Exception as exc:
                 logger.warning(f"Gemini adaptation failed, falling back to local conciseness: {exc}")
 
         # Fallback to intelligent, non-destructive local conciseness
-        return self._adapt_locally(
+        adapted_local = self._adapt_locally(
             source_text=source_text,
             translated_text=translated_text,
             target_duration=target_duration,
@@ -113,6 +158,9 @@ class TextDurationAdapter:
             target_language=target_language,
             attempt=attempt,
         )
+        if len(adapted_local.split()) >= min_words:
+            return adapted_local
+        return translated_text
 
     def _adapt_with_gemini(
         self,
@@ -179,20 +227,26 @@ Guidelines:
                 text = re.sub(r"[।]+$", "।", text)
                 return text
 
-        # Step 2: Apply redundancy stripping
+        ratio = target_duration / max(0.1, generated_duration)
+
+        # Step 2: Apply conversational phrase simplifications when duration reduction is needed
+        if ratio < 0.95:
+            for pat, rep in HINDI_CONVERSATIONAL_SIMPLIFICATIONS:
+                text = _devanagari_sub(pat, rep, text)
+
+        # Step 3: Apply redundancy stripping
         for pat, rep in HINDI_REDUNDANCIES:
-            text = re.sub(pat, rep, text).strip()
+            text = _devanagari_sub(pat, rep, text)
 
         # Clean multiple spaces or stray punctuation
         text = re.sub(r"\s+", " ", text).strip()
         text = re.sub(r"\s+([,।?!])", r"\1", text)
         text = re.sub(r"[।]+$", "।", text)
 
-        # Step 3: Gentle conversational filler reduction if duration reduction is requested
-        ratio = target_duration / max(0.1, generated_duration)
+        # Step 4: Gentle conversational filler reduction if duration reduction is requested
         if ratio < 0.85:
             for pat, rep in HINDI_CONVERSATIONAL_FILLERS:
-                text = re.sub(pat, rep, text).strip()
+                text = _devanagari_sub(pat, rep, text)
             text = re.sub(r"\s+", " ", text).strip()
             text = re.sub(r"\s+([,।?!])", r"\1", text)
             text = re.sub(r"[।]+$", "।", text)

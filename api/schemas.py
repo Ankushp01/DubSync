@@ -30,6 +30,7 @@ class JobStatusResponse(BaseModel):
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     source_language: str
+    detected_source_language: Optional[str] = None
     target_language: str
     duration_seconds: Optional[float] = None
     enable_lip_sync: bool
@@ -58,6 +59,7 @@ class JobResultResponse(BaseModel):
     transcript_url: Optional[str] = None
     translation_url: Optional[str] = None
     source_language: str
+    detected_source_language: Optional[str] = None
     target_language: str
     duration_seconds: Optional[float] = None
     voice_mode: str

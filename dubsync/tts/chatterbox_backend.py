@@ -563,12 +563,12 @@ def run_stage3(
 
         # -----------------------------------------------------
         # Duration Text Adaptation Loop
-        # Trigger when TTS duration exceeds effective target by > 15%
+        # Trigger when TTS duration exceeds effective target by > 10%
         # -----------------------------------------------------
 
         while (
             (
-                generated_duration > effective_target * 1.25
+                generated_duration > effective_target * 1.10
                 or generated_duration > HARD_MAX_TTS_AUDIO_SECONDS
             )
             and gemini_attempts < max_gemini_attempts
@@ -607,9 +607,11 @@ def run_stage3(
                 print("Text adaptation produced identical text, stopping loop.")
                 break
 
-            # Safety check: ensure adaptation does not discard spoken content (>30% word drop)
-            if len(revised_text.split()) < max(3, int(len(original_text.split()) * 0.70)):
-                print("Adapted text dropped more than 30% of words. Rejecting adaptation to preserve spoken content.")
+            # Safety check: ensure adaptation does not discard spoken content
+            target_ratio = effective_target / max(0.1, generated_duration)
+            min_ratio = max(0.50, min(0.70, target_ratio * 0.95))
+            if len(revised_text.split()) < max(3, int(len(original_text.split()) * min_ratio)):
+                print("Adapted text dropped more than allowed proportional limit. Rejecting adaptation.")
                 break
 
             print(

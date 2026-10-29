@@ -250,6 +250,7 @@ def run_stage4(
     stage3_path: str | Path,
     output_dir: str | Path,
     source_audio_path: str | Path | None = None,
+    allow_timeline_extension: bool = True,
 ) -> Path:
     """
     Assemble Stage 3 TTS segments into one timeline-aligned WAV with duration adaptation.
@@ -268,6 +269,7 @@ def run_stage4(
         stage3_path=stage3_path,
         output_path=output_path,
         source_audio_path=source_audio_path,
+        allow_timeline_extension=allow_timeline_extension,
     )
 
 def run_stage5(

@@ -32,6 +32,12 @@ MAX_FALLBACK_SPEED = 1.25
 MIN_SILENCE_MARGIN = 0.05  # 50ms silence between speech clips
 
 
+class TimingConflictError(RuntimeError):
+    """Raised when audio content cannot fit within the available timeline without trimming,
+    and timeline extension is disallowed."""
+    pass
+
+
 def _safe_str(s: str) -> str:
     """Safely format string so it never crashes console printing."""
     try:
@@ -151,6 +157,7 @@ def assemble_stage3_audio(
     output_path: str | Path,
     source_audio_path: Optional[str | Path] = None,
     ffmpeg_executable: str = "ffmpeg",
+    allow_timeline_extension: bool = True,
 ) -> Path:
     """Assemble Stage 3 TTS audio segments onto a clean, natural, non-overlapping timeline.
 
@@ -161,8 +168,9 @@ def assemble_stage3_audio(
        and 1.25x (max fallback). Extreme speeds (e.g. 1.5x - 2.33x+) are NEVER applied.
     4. Clips can safely expand into natural trailing silence gaps before the next segment.
     5. Silence and natural pauses between dialogue segments are preserved.
-    6. Comprehensive duration quality check & classification table is logged.
-    7. Final audio duration matches the source video/audio duration.
+    6. Substantive translated speech is NEVER silently truncated. If speech exceeds
+       the original timeline, timeline is extended or explicit TimingConflictError is raised.
+    7. Per-segment duration accounting record is generated and persisted.
     """
     stage3_path = Path(stage3_path).resolve()
     output_path = Path(output_path).resolve()
@@ -187,16 +195,18 @@ def assemble_stage3_audio(
     sample_rate = first_params["sample_rate"]
 
     # Determine total timeline duration from source audio if available
-    source_duration: Optional[float] = None
+    orig_source_duration: Optional[float] = None
     if source_audio_path:
         src = Path(source_audio_path).resolve()
         if src.is_file():
-            source_duration = sf.info(str(src)).duration
+            orig_source_duration = sf.info(str(src)).duration
 
-    if source_duration is None:
+    if orig_source_duration is None:
         default_src = manifest_dir / "source_16khz_mono.wav"
         if default_src.is_file():
-            source_duration = sf.info(str(default_src)).duration
+            orig_source_duration = sf.info(str(default_src)).duration
+
+    source_duration = orig_source_duration
 
     # Step 1: Sanitize and sort dialogue segments by start timestamp
     sorted_segments = sorted(segments, key=lambda s: float(s.get("start", 0.0)))
@@ -224,6 +234,7 @@ def assemble_stage3_audio(
     # Step 2: Determine available duration, apply natural duration adaptation, and compute placement
     planned_placements = []
     adaptation_log = []
+    current_cursor = 0.0
 
     for idx, seg in enumerate(sorted_segments):
         seg_start = seg["start"]
@@ -238,34 +249,110 @@ def assemble_stage3_audio(
             raise FileNotFoundError(f"Segment audio file not found: {audio_file}")
 
         tts_dur = round(sf.info(str(audio_file)).duration, 3)
+        raw_audio_file = manifest_dir / seg.get("raw_audio", seg["audio"])
+        raw_tts_dur = round(sf.info(str(raw_audio_file)).duration, 3) if raw_audio_file.is_file() else tts_dur
 
-        # Determine when next speech segment begins
+        # Determine earliest non-overlapping placement start
+        if current_cursor == 0.0:
+            placement_start = seg_start
+        else:
+            earliest_valid_start = round(current_cursor + MIN_SILENCE_MARGIN, 3)
+            if earliest_valid_start <= seg_start:
+                # Slot has leading silence or matches segment start
+                # If this segment is under timing pressure, check if natural pause can be used
+                if (tts_dur / target_dur > 1.0) and (seg_start > earliest_valid_start):
+                    needed_slot = tts_dur / MAX_NORMAL_SPEED
+                    extra_time = needed_slot - target_dur
+                    pre_gap = seg_start - earliest_valid_start
+                    shift_back = min(pre_gap, extra_time)
+                    placement_start = round(seg_start - shift_back, 3)
+                else:
+                    placement_start = seg_start
+            else:
+                # Previous segment extended past seg_start; ripple-shift to avoid collision
+                placement_start = earliest_valid_start
+
+        # Determine available end boundary for this segment
         if idx + 1 < len(sorted_segments):
             next_start = sorted_segments[idx + 1]["start"]
+            space_before_next = round(next_start - placement_start - MIN_SILENCE_MARGIN, 3)
+            # If TTS can fit cleanly before next segment with normal speed, reserve silence margin
+            if space_before_next > 0 and (tts_dur / space_before_next) <= MAX_NORMAL_SPEED:
+                available_slot = space_before_next
+            else:
+                available_slot = round(max(target_dur, space_before_next), 3)
         else:
-            next_start = source_duration if source_duration else round(seg_start + max(target_dur, tts_dur) + 1.0, 3)
-
-        # Maximum duration this clip could extend into without encroaching on next speech
-        max_extendable_dur = round(max(target_dur, next_start - seg_start - MIN_SILENCE_MARGIN), 3)
+            # Final segment on timeline
+            if orig_source_duration and orig_source_duration > placement_start:
+                available_slot = round(orig_source_duration - placement_start, 3)
+            elif source_duration and source_duration > placement_start:
+                available_slot = round(source_duration - placement_start, 3)
+            else:
+                available_slot = target_dur
 
         speed_factor = 1.0
         final_dur = tts_dur
         final_clip_path = audio_file
         classification = "NORMAL"
+        trimmed_seconds = 0.0
+        all_speech_preserved = True
+        timeline_extended = False
+        extension_seconds = 0.0
+        timing_conflict = None
 
-        if tts_dur <= target_dur:
-            # Fits within original slot without any acceleration
+        required_speed = tts_dur / available_slot if available_slot > 0 else 999.0
+
+        if tts_dur <= available_slot or required_speed <= 1.0:
+            # Fits comfortably without acceleration
             speed_factor = 1.0
             final_dur = tts_dur
+            final_clip_path = audio_file
             classification = "TEXT_SHORTENED" if text_was_adapted else "NORMAL"
+            adaptation_log.append(f"Segment {idx+1}: Speech fits naturally ({tts_dur:.2f}s in {available_slot:.2f}s slot)")
+
+        elif required_speed <= MAX_NORMAL_SPEED:
+            # Mild natural speed adjustment (1.00x - 1.15x) fits inside available slot
+            speed_factor = round(required_speed, 2)
+            desired_dur = available_slot
+            adapted_file = manifest_dir / f"segment_{idx+1:03d}_adapted.wav"
+            final_dur = time_stretch_audio(
+                input_wav=audio_file,
+                output_wav=adapted_file,
+                target_duration=desired_dur,
+                ffmpeg_executable=ffmpeg_executable,
+            )
+            final_clip_path = adapted_file
+            classification = "MILD_SPEED_ADJUSTMENT"
+            adaptation_log.append(
+                f"Segment {idx+1}: Mild speed adjustment {required_speed:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s) to fit {available_slot:.2f}s"
+            )
+
+        elif required_speed <= MAX_FALLBACK_SPEED:
+            # Moderate speed adjustment (1.15x - 1.25x) fits inside available slot
+            speed_factor = round(required_speed, 2)
+            desired_dur = available_slot
+            adapted_file = manifest_dir / f"segment_{idx+1:03d}_adapted.wav"
+            final_dur = time_stretch_audio(
+                input_wav=audio_file,
+                output_wav=adapted_file,
+                target_duration=desired_dur,
+                ffmpeg_executable=ffmpeg_executable,
+            )
+            final_clip_path = adapted_file
+            classification = "MILD_SPEED_ADJUSTMENT"
+            adaptation_log.append(
+                f"Segment {idx+1}: Moderate speed adjustment {required_speed:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s) to fit {available_slot:.2f}s"
+            )
+
         else:
-            # Clip is longer than target_dur. Check required speed.
-            required_speed = tts_dur / target_dur
+            # Required speed > 1.25x: Do NOT use extreme atempo!
+            # Clamp atempo to MAX_FALLBACK_SPEED (1.25x)
+            speed_factor = MAX_FALLBACK_SPEED
+            compressed_dur = round(tts_dur / MAX_FALLBACK_SPEED, 3)
 
-            if required_speed <= MAX_NORMAL_SPEED:
-                # Mild natural speed adjustment (1.00x - 1.15x) fits exactly inside target_dur
-                speed_factor = round(required_speed, 2)
-                desired_dur = target_dur
+            if compressed_dur <= available_slot:
+                # Fits inside slot/trailing gap at 1.25x
+                desired_dur = compressed_dur
                 adapted_file = manifest_dir / f"segment_{idx+1:03d}_adapted.wav"
                 final_dur = time_stretch_audio(
                     input_wav=audio_file,
@@ -274,37 +361,14 @@ def assemble_stage3_audio(
                     ffmpeg_executable=ffmpeg_executable,
                 )
                 final_clip_path = adapted_file
-                classification = "MILD_SPEED_ADJUSTMENT"
+                classification = "TEXT_SHORTENED" if text_was_adapted else "MILD_SPEED_ADJUSTMENT"
                 adaptation_log.append(
-                    f"Segment {idx+1}: Mild speed adjustment {required_speed:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s) to fit {target_dur:.2f}s"
+                    f"Segment {idx+1}: Clamped speed to {MAX_FALLBACK_SPEED:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s) utilizing {available_slot:.2f}s gap"
                 )
-
-            elif required_speed <= MAX_FALLBACK_SPEED:
-                # Moderate speed adjustment (1.15x - 1.25x) fits inside target_dur
-                speed_factor = round(required_speed, 2)
-                desired_dur = target_dur
-                adapted_file = manifest_dir / f"segment_{idx+1:03d}_adapted.wav"
-                final_dur = time_stretch_audio(
-                    input_wav=audio_file,
-                    output_wav=adapted_file,
-                    target_duration=desired_dur,
-                    ffmpeg_executable=ffmpeg_executable,
-                )
-                final_clip_path = adapted_file
-                classification = "MILD_SPEED_ADJUSTMENT"
-                adaptation_log.append(
-                    f"Segment {idx+1}: Moderate speed adjustment {required_speed:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s) to fit {target_dur:.2f}s"
-                )
-
             else:
-                # Required speed > 1.25x! DO NOT use excessive atempo!
-                # Prioritize natural speech: clamp atempo to MAX_FALLBACK_SPEED (1.25x)
-                # and extend into trailing silence gap before next segment.
-                speed_factor = MAX_FALLBACK_SPEED
-                compressed_dur = round(tts_dur / MAX_FALLBACK_SPEED, 3)
-
-                if compressed_dur <= max_extendable_dur:
-                    # Fits comfortably inside trailing silence gap!
+                # Compressed speech exceeds available slot
+                if allow_timeline_extension:
+                    # Extend timeline to preserve 100% of spoken content without trimming
                     desired_dur = compressed_dur
                     adapted_file = manifest_dir / f"segment_{idx+1:03d}_adapted.wav"
                     final_dur = time_stretch_audio(
@@ -314,34 +378,29 @@ def assemble_stage3_audio(
                         ffmpeg_executable=ffmpeg_executable,
                     )
                     final_clip_path = adapted_file
-                    classification = "TEXT_SHORTENED" if text_was_adapted else "MILD_SPEED_ADJUSTMENT"
+                    classification = "TIMELINE_EXTENDED"
                     adaptation_log.append(
-                        f"Segment {idx+1}: Clamped speed to {MAX_FALLBACK_SPEED:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s) utilizing {max_extendable_dur:.2f}s silence gap"
+                        f"Segment {idx+1}: Clamped speed to {MAX_FALLBACK_SPEED:.2f}x ({tts_dur:.2f}s -> {final_dur:.2f}s); timeline extended to preserve complete speech"
                     )
                 else:
-                    # Compressed audio still exceeds trailing gap.
-                    # Compress at 1.25x and smoothly trim/fade the trailing audio to avoid overlap.
-                    adapted_file = manifest_dir / f"segment_{idx+1:03d}_adapted.wav"
-                    time_stretch_audio(
-                        input_wav=audio_file,
-                        output_wav=adapted_file,
-                        target_duration=compressed_dur,
-                        ffmpeg_executable=ffmpeg_executable,
+                    timing_conflict = (
+                        f"Segment {idx+1} requires {compressed_dur:.3f}s at maximum speed {MAX_FALLBACK_SPEED}x, "
+                        f"exceeding available slot {available_slot:.3f}s by {round(compressed_dur - available_slot, 3):.3f}s. "
+                        f"Timeline extension is disabled."
                     )
-                    trimmed_file = manifest_dir / f"segment_{idx+1:03d}_trimmed.wav"
-                    final_dur = _safe_trim_audio(
-                        input_wav=adapted_file,
-                        output_wav=trimmed_file,
-                        max_duration=max_extendable_dur,
-                    )
-                    final_clip_path = trimmed_file
-                    classification = "DURATION_WARNING"
-                    adaptation_log.append(
-                        f"Segment {idx+1}: DURATION_WARNING: Clamped to {MAX_FALLBACK_SPEED:.2f}x and trimmed to {max_extendable_dur:.2f}s to avoid overlap"
-                    )
+                    raise TimingConflictError(timing_conflict)
 
-        placement_start = seg_start
         placement_end = round(placement_start + final_dur, 3)
+        current_cursor = placement_end
+
+        # Sub-frame rounding tolerance (50ms ~ 1 video frame at 24fps)
+        EXTENSION_TOLERANCE = 0.05
+        if orig_source_duration and (placement_end - orig_source_duration) > EXTENSION_TOLERANCE:
+            timeline_extended = True
+            extension_seconds = round(placement_end - orig_source_duration, 3)
+        elif idx + 1 < len(sorted_segments) and (placement_end - sorted_segments[idx + 1]["start"]) > EXTENSION_TOLERANCE:
+            timeline_extended = True
+            extension_seconds = round(placement_end - sorted_segments[idx + 1]["start"], 3)
 
         planned_placements.append({
             "index": idx + 1,
@@ -349,7 +408,8 @@ def assemble_stage3_audio(
             "seg_end": seg_end,
             "target_duration": target_dur,
             "tts_duration": tts_dur,
-            "available_duration": target_dur,
+            "raw_tts_duration": raw_tts_dur,
+            "available_duration": available_slot,
             "final_duration": final_dur,
             "placement_start": placement_start,
             "placement_end": placement_end,
@@ -358,16 +418,17 @@ def assemble_stage3_audio(
             "adaptation_attempts": adaptation_attempts,
             "classification": classification,
             "translated_text": trans_text,
+            "trimmed_seconds": trimmed_seconds,
+            "all_speech_preserved": all_speech_preserved,
+            "timeline_extended": timeline_extended,
+            "extension_seconds": extension_seconds,
+            "timing_conflict": timing_conflict,
         })
 
     # Step 3: Programmatic Timeline Validation
     for i, p in enumerate(planned_placements):
         if i > 0:
             prev = planned_placements[i - 1]
-            if p["seg_start"] < prev["seg_end"]:
-                raise ValueError(
-                    f"Timeline validation failed: Segment {p['index']} start ({p['seg_start']}s) < previous segment end ({prev['seg_end']}s)"
-                )
             if p["placement_start"] < prev["placement_end"]:
                 raise ValueError(
                     f"Timeline validation failed: Segment {p['index']} clip placement ({p['placement_start']}s) overlaps previous clip end ({prev['placement_end']}s)"
@@ -375,51 +436,103 @@ def assemble_stage3_audio(
 
         if i + 1 < len(planned_placements):
             next_p = planned_placements[i + 1]
-            if p["placement_end"] > next_p["seg_start"]:
+            if p["placement_end"] > next_p["placement_start"]:
                 raise ValueError(
-                    f"Timeline validation failed: Segment {p['index']} clip end ({p['placement_end']}s) extends into next segment start ({next_p['seg_start']}s)"
+                    f"Timeline validation failed: Segment {p['index']} clip end ({p['placement_end']}s) overlaps next clip start ({next_p['placement_start']}s)"
                 )
 
     # Determine total timeline frames
     max_clip_end = max(p["placement_end"] for p in planned_placements)
-    if source_duration is None:
-        source_duration = max(max_clip_end, max(p["seg_end"] for p in planned_placements))
+    has_extension = any(p["timeline_extended"] for p in planned_placements)
+    if not has_extension and orig_source_duration is not None:
+        source_duration = orig_source_duration
+    elif source_duration is None:
+        source_duration = max_clip_end
     else:
         source_duration = max(source_duration, max_clip_end)
 
     total_frames = round(source_duration * sample_rate)
     total_timeline_sec = round(total_frames / sample_rate, 3)
 
-    # Step 4: Log detailed duration quality check and classification table
-    print("\n" + "=" * 135)
-    print("DUBBED AUDIO DURATION QUALITY CHECK & TIMELINE VALIDATION")
-    print("=" * 135)
+    # Step 4: Build per-segment accounting records (Requirement 8)
+    accounting_records = []
+    for p in planned_placements:
+        rec = {
+            "segment_index": p["index"],
+            "original_slot": [p["seg_start"], p["seg_end"]],
+            "original_slot_duration": round(p["seg_end"] - p["seg_start"], 3),
+            "raw_tts_duration": p["raw_tts_duration"],
+            "processed_tts_duration": p["tts_duration"],
+            "applied_speed_factor": p["adapted_speed"],
+            "timeline_placement": [p["placement_start"], p["placement_end"]],
+            "placed_duration": p["final_duration"],
+            "trimmed_seconds": p["trimmed_seconds"],
+            "all_speech_preserved": p["all_speech_preserved"],
+            "timeline_extended": p["timeline_extended"],
+            "extension_seconds": p["extension_seconds"],
+            "unresolved_timing_conflict": p["timing_conflict"],
+            "classification": p["classification"],
+            "translated_text": p["translated_text"],
+        }
+        accounting_records.append(rec)
+
+    # Write timing accounting artifact
+    accounting_artifact = {
+        "schema_version": 1,
+        "source_duration": orig_source_duration,
+        "assembled_duration": total_timeline_sec,
+        "timeline_extended": any(r["timeline_extended"] for r in accounting_records),
+        "total_extension_seconds": round(max(0.0, total_timeline_sec - (orig_source_duration or total_timeline_sec)), 3),
+        "total_trimmed_seconds": round(sum(r["trimmed_seconds"] for r in accounting_records), 3),
+        "all_speech_preserved": all(r["all_speech_preserved"] for r in accounting_records),
+        "segments": accounting_records,
+    }
+    accounting_path = manifest_dir / "timing_accounting.json"
+    with accounting_path.open("w", encoding="utf-8") as f:
+        json.dump(accounting_artifact, f, indent=2, ensure_ascii=False)
+
+    # Also update stage3 manifest
+    manifest["timing_accounting"] = accounting_records
+    manifest["timeline_extended"] = accounting_artifact["timeline_extended"]
+    manifest["assembled_duration"] = total_timeline_sec
+    with stage3_path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    # Log detailed duration accounting table
+    print("\n" + "=" * 145)
+    print("DUBBED AUDIO TIMELINE ACCOUNTING & DURATION VERIFICATION")
+    print("=" * 145)
     header = (
-        f"{'Segment':<7} | {'Start':<6} | {'End':<6} | {'Avail Dur':<9} | "
-        f"{'Translated Text':<30} | {'TTS Dur':<7} | {'Final Dur':<9} | "
-        f"{'Speed Adj':<9} | {'Adapt Attempts':<14} | {'Classification':<22}"
+        f"{'Seg':<4} | {'Orig Slot':<16} | {'Raw TTS':<8} | {'Proc TTS':<9} | "
+        f"{'Speed':<6} | {'Placed Slot':<17} | {'Placed Dur':<10} | {'Trimmed':<8} | "
+        f"{'Preserved':<9} | {'Extended':<9} | {'Classification':<20}"
     )
     print(header)
-    print("-" * 135)
-    for p in planned_placements:
-        txt = _safe_str(p["translated_text"])
-        short_txt = (txt[:27] + "...") if len(txt) > 30 else txt
+    print("-" * 145)
+    for r in accounting_records:
+        orig_s = f"{r['original_slot'][0]:.2f}s - {r['original_slot'][1]:.2f}s"
+        placed_s = f"{r['timeline_placement'][0]:.2f}s - {r['timeline_placement'][1]:.2f}s"
+        ext_s = f"+{r['extension_seconds']:.2f}s" if r['timeline_extended'] else "NO"
+        pres_s = "YES" if r['all_speech_preserved'] else "NO"
         row = (
-            f"{p['index']:<7} | {p['seg_start']:<6.2f} | {p['seg_end']:<6.2f} | "
-            f"{p['available_duration']:<7.2f}s | {short_txt:<30} | "
-            f"{p['tts_duration']:<5.2f}s | {p['final_duration']:<7.2f}s | "
-            f"{p['adapted_speed']:<7.2f}x | {p['adaptation_attempts']:<14} | "
-            f"{p['classification']:<22}"
+            f"{r['segment_index']:<4} | {orig_s:<16} | {r['raw_tts_duration']:<6.2f}s | {r['processed_tts_duration']:<7.2f}s | "
+            f"{r['applied_speed_factor']:<5.2f}x | {placed_s:<17} | {r['placed_duration']:<8.2f}s | {r['trimmed_seconds']:<6.2f}s | "
+            f"{pres_s:<9} | {ext_s:<9} | {r['classification']:<20}"
         )
         print(_safe_str(row))
-    print("=" * 135)
+    print("=" * 145)
     if adaptation_log:
         print("DURATION ADAPTATIONS APPLIED:")
         for log_item in adaptation_log:
             print(f"  • {log_item}")
-        print("=" * 135)
-    print(f"Total Source Duration: {source_duration:.2f}s | Assembled Audio Duration: {total_timeline_sec:.2f}s")
-    print("Timeline Verification Status: PASS (0 overlaps, natural speech pacing, silence preserved)\n")
+        print("=" * 145)
+    orig_s_dur = f"{orig_source_duration:.2f}s" if orig_source_duration else "N/A"
+    print(f"Original Video/Source Duration: {orig_s_dur} | Assembled Dubbed Audio Duration: {total_timeline_sec:.2f}s")
+    if accounting_artifact["timeline_extended"]:
+        print(f"Timeline Status: EXTENDED (+{accounting_artifact['total_extension_seconds']:.2f}s to preserve 100% spoken content)")
+    else:
+        print("Timeline Status: PASS (matches original timeline, 0 trimmed seconds)")
+    print("Zero-Overlap & Content Integrity Verification: PASS\n")
 
     # Step 5: Assemble onto timeline buffer
     assembled = np.zeros(total_frames, dtype=np.int16)

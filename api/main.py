@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes.jobs import router as jobs_router
 from api.routes.files import router as files_router
+from api.routes.languages import router as languages_router
 from dubsync.readiness import check_system_readiness
 from dubsync.stt.whisper import ensure_whisper_model_cached
 
@@ -64,6 +65,7 @@ app.add_middleware(
 # Register routes
 app.include_router(jobs_router)
 app.include_router(files_router)
+app.include_router(languages_router)
 
 
 @app.get("/health")

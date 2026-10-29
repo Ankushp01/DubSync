@@ -134,7 +134,17 @@ def check_indictrans_readiness() -> Dict[str, Any]:
 
 
 def check_chatterbox_readiness(target_language: str = "hi") -> Dict[str, Any]:
-    """Verify Chatterbox TTS virtual environment and model availability."""
+    """Verify Chatterbox TTS virtual environment, language support, and model availability."""
+    from dubsync.languages import resolve_chatterbox_tag
+
+    chatterbox_lang = resolve_chatterbox_tag(target_language)
+    if not chatterbox_lang:
+        return {
+            "status": "unsupported_language",
+            "ready": False,
+            "error": f"Target language '{target_language}' is not supported by Chatterbox Multilingual V3 TTS.",
+        }
+
     if not TTS_PYTHON.is_file():
         return {
             "status": "error",
@@ -166,6 +176,7 @@ def check_chatterbox_readiness(target_language: str = "hi") -> Dict[str, Any]:
         "ready": True,
         "venv": str(TTS_PYTHON),
         "language": target_language,
+        "chatterbox_language_id": chatterbox_lang,
     }
 
 
@@ -202,6 +213,7 @@ def check_wav2lip_readiness() -> Dict[str, Any]:
 
 
 def check_system_readiness(
+    source_language: str = "auto",
     target_language: str = "hi",
     enable_lip_sync: bool = True,
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -210,6 +222,12 @@ def check_system_readiness(
     Returns:
         (is_ready, details_dict, error_message_if_any)
     """
+    from dubsync.languages import validate_language_pair
+
+    pair_valid, pair_error = validate_language_pair(source_language, target_language)
+    if not pair_valid:
+        return False, {"language_pair": {"ready": False, "error": pair_error}}, f"Unsupported language pair: {pair_error}"
+
     cuda = check_cuda_readiness()
     whisper = check_whisper_readiness()
     indictrans = check_indictrans_readiness()
@@ -217,6 +235,7 @@ def check_system_readiness(
     wav2lip = check_wav2lip_readiness() if enable_lip_sync else {"status": "skipped", "ready": True}
 
     details = {
+        "language_pair": {"ready": True, "source": source_language, "target": target_language},
         "cuda": cuda,
         "whisper": whisper,
         "indictrans": indictrans,

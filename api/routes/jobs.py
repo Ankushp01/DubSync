@@ -40,9 +40,19 @@ async def create_job(
     if len(video_bytes) == 0:
         raise HTTPException(status_code=400, detail="Uploaded video file is empty")
 
+    # Explicit language capability check: ensure requested language pair is supported
+    from dubsync.languages import validate_language_pair
+    is_pair_valid, pair_error = validate_language_pair(source_language, target_language)
+    if not is_pair_valid:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported language pair: {pair_error}",
+        )
+
     # Explicit preflight check: ensure models & runtimes are ready before accepting job
     from dubsync.readiness import check_system_readiness
     is_ready, details, error_msg = check_system_readiness(
+        source_language=source_language,
         target_language=target_language,
         enable_lip_sync=enable_lip_sync,
     )
@@ -91,6 +101,7 @@ async def list_jobs():
             started_at=j.get("started_at"),
             completed_at=j.get("completed_at"),
             source_language=j["source_language"],
+            detected_source_language=j.get("detected_source_language"),
             target_language=j["target_language"],
             duration_seconds=j.get("duration_seconds"),
             enable_lip_sync=j.get("enable_lip_sync", True),
@@ -120,6 +131,7 @@ async def get_job(job_id: str):
         started_at=j.get("started_at"),
         completed_at=j.get("completed_at"),
         source_language=j["source_language"],
+        detected_source_language=j.get("detected_source_language"),
         target_language=j["target_language"],
         duration_seconds=j.get("duration_seconds"),
         enable_lip_sync=j.get("enable_lip_sync", True),
@@ -236,6 +248,7 @@ async def get_job_result(job_id: str):
         transcript_url=artifacts.get("transcript_json_url"),
         translation_url=artifacts.get("translation_json_url"),
         source_language=j["source_language"],
+        detected_source_language=j.get("detected_source_language"),
         target_language=j["target_language"],
         duration_seconds=j.get("duration_seconds"),
         voice_mode=j.get("voice_mode", "original"),

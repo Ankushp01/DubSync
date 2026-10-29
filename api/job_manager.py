@@ -33,20 +33,13 @@ REGISTRY_FILE = JOBS_DIR / "registry.json"
 WAV2LIP_PYTHON = PROJECT_ROOT / ".wav2lip-venv" / "Scripts" / "python.exe"
 WAV2LIP_DIR = PROJECT_ROOT / "Wav2Lip-HD"
 
-LANGUAGE_MAP: Dict[str, Dict[str, str]] = {
-    "hi": {"indictrans": "hin_Deva", "tts": "hi", "name": "Hindi"},
-    "mr": {"indictrans": "mar_Deva", "tts": "mr", "name": "Marathi"},
-    "bn": {"indictrans": "ben_Beng", "tts": "bn", "name": "Bengali"},
-    "ta": {"indictrans": "tam_Taml", "tts": "ta", "name": "Tamil"},
-    "te": {"indictrans": "tel_Telu", "tts": "te", "name": "Telugu"},
-    "gu": {"indictrans": "guj_Gujr", "tts": "gu", "name": "Gujarati"},
-    "kn": {"indictrans": "kan_Knda", "tts": "kn", "name": "Kannada"},
-    "ml": {"indictrans": "mal_Mlym", "tts": "ml", "name": "Malayalam"},
-    "pa": {"indictrans": "pan_Guru", "tts": "pa", "name": "Punjabi"},
-    "es": {"indictrans": "spa_Latn", "tts": "es", "name": "Spanish"},
-    "fr": {"indictrans": "fra_Latn", "tts": "fr", "name": "French"},
-    "de": {"indictrans": "deu_Latn", "tts": "de", "name": "German"},
-}
+from dubsync.languages import (
+    evaluate_language_pair,
+    get_language,
+    resolve_chatterbox_tag,
+    resolve_indictrans_tag,
+    resolve_whisper_code,
+)
 
 DEFAULT_STAGES = [
     {"id": "extracting_audio", "name": "Extracting audio", "stage_number": 1, "status": "queued", "details": "16 kHz mono extraction"},
@@ -248,10 +241,11 @@ class JobManager:
                 config_path = PROJECT_ROOT / "configs" / "default.toml"
             config = load_config(config_path)
 
-            # Map language codes using dataclasses.replace on frozen configs
-            lang_info = LANGUAGE_MAP.get(job["target_language"], {"indictrans": "hin_Deva", "tts": "hi"})
-            new_translation = replace(config.translation, target_language=lang_info["indictrans"])
-            new_tts = replace(config.tts, language_id=lang_info["tts"])
+            # Initial default configuration
+            indictrans_tgt = resolve_indictrans_tag(job["target_language"]) or "hin_Deva"
+            tts_tgt = resolve_chatterbox_tag(job["target_language"]) or "hi"
+            new_translation = replace(config.translation, target_language=indictrans_tgt)
+            new_tts = replace(config.tts, language_id=tts_tgt)
             config = replace(config, translation=new_translation, tts=new_tts)
 
             # -------------------------------------------------------------
@@ -296,17 +290,20 @@ class JobManager:
                 model_name=config.whisper.model_name,
                 model_path=config.whisper.model_path,
             )
+
+            whisper_lang = resolve_whisper_code(job.get("source_language", "auto"))
             transcript = transcriber.transcribe(
                 source_audio_path,
-                language=config.whisper.language,
+                language=whisper_lang or config.whisper.language or None,
                 beam_size=config.whisper.beam_size,
                 vad_filter=config.whisper.vad_filter,
             )
             _write_stage1(transcript_path, transcript, config)
 
             # Record detected source language and dialogue segments
-            job["detected_source_language"] = transcript.language
-            self._update_stage_status(job, "transcribing", "completed", f"{len(transcript.segments)} segments detected")
+            detected_lang = transcript.language or "en"
+            job["detected_source_language"] = detected_lang
+            self._update_stage_status(job, "transcribing", "completed", f"{len(transcript.segments)} segments detected ({detected_lang})")
             job["overall_progress"] = 40
             self._save_registry()
 
@@ -315,8 +312,28 @@ class JobManager:
             # -------------------------------------------------------------
             if job["status"] == "cancelled":
                 return
+
+            # Verify that detected source language can route to requested target language
+            pair_eval = evaluate_language_pair(detected_lang, job["target_language"])
+            if not pair_eval.usable:
+                raise RuntimeError(
+                    f"Language routing failure: Audio detected as '{detected_lang}', "
+                    f"which cannot be translated to '{job['target_language']}' in the active pipeline. {pair_eval.reason}"
+                )
+
+            target_info = get_language(job["target_language"])
+            target_name = target_info.name if target_info else job["target_language"]
+            indictrans_src = resolve_indictrans_tag(detected_lang) or "eng_Latn"
+
+            new_translation = replace(
+                config.translation,
+                source_language=indictrans_src,
+                target_language=indictrans_tgt,
+            )
+            config = replace(config, translation=new_translation)
+
             job["current_stage"] = "translating"
-            job["current_operation"] = f"Translating dialogue to {lang_info.get('name', 'target language')} (IndicTrans2)..."
+            job["current_operation"] = f"Translating dialogue from {detected_lang} to {target_name} (IndicTrans2)..."
             job["overall_progress"] = 45
             self._update_stage_status(job, "translating", "processing")
             self._save_registry()
@@ -359,7 +376,22 @@ class JobManager:
             self._emit_event(job_id, "aligning_audio", "processing", 85, job["current_operation"])
 
             dubbed_audio_path = run_stage4(stage3_path, output_dir, source_audio_path=source_audio_path)
-            self._update_stage_status(job, "aligning_audio", "completed")
+            accounting_path = output_dir / "timing_accounting.json"
+            if accounting_path.is_file():
+                try:
+                    with accounting_path.open("r", encoding="utf-8") as af:
+                        acct_data = json.load(af)
+                    if acct_data.get("timeline_extended"):
+                        ext_sec = acct_data.get("total_extension_seconds", 0.0)
+                        self._update_stage_status(
+                            job, "aligning_audio", "completed", f"Timeline extended (+{ext_sec:.2f}s) to preserve full dialogue"
+                        )
+                    else:
+                        self._update_stage_status(job, "aligning_audio", "completed", "Audio aligned with zero trimming")
+                except Exception:
+                    self._update_stage_status(job, "aligning_audio", "completed")
+            else:
+                self._update_stage_status(job, "aligning_audio", "completed")
             job["overall_progress"] = 90
             self._save_registry()
 
@@ -432,6 +464,7 @@ class JobManager:
                 "dubbed_audio_url": f"/api/v1/files/{job_id}/output/audio/{dubbed_audio_path.name}",
                 "transcript_json_url": f"/api/v1/files/{job_id}/output/{transcript_path.name}",
                 "translation_json_url": f"/api/v1/files/{job_id}/output/{stage2_path.name}",
+                "timing_accounting_url": f"/api/v1/files/{job_id}/output/timing_accounting.json",
             }
 
             self._save_registry()
