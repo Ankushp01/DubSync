@@ -24,14 +24,20 @@ async def get_job_file(
     """Serve job input and output files (video, audio, JSON) with ownership enforcement."""
     # Verify ownership of the job
     job = job_manager.get_job(job_id)
-    if job:
-        if job.get("user_id") != current_user.user_id:
-            raise HTTPException(status_code=404, detail="Requested file not found")
+    job_user_id = job.get("user_id") if job else None
+
+    is_owner = False
+    if job_user_id and job_user_id == current_user.user_id:
+        is_owner = True
+    elif job and not job_user_id:
+        # Local development jobs created without user_id
+        is_owner = True
     elif db_manager.is_connected:
         db_job = await ProcessingJobsRepository().get_by_id_for_user(job_id, current_user.user_id)
-        if not db_job:
-            raise HTTPException(status_code=404, detail="Requested file not found")
-    else:
+        if db_job:
+            is_owner = True
+
+    if not is_owner:
         raise HTTPException(status_code=404, detail="Requested file not found")
 
     # Resolve job path safely
@@ -63,4 +69,5 @@ async def get_job_file(
         path=str(target_file),
         media_type=mime_type,
         filename=target_file.name,
+        headers={"Accept-Ranges": "bytes"},
     )

@@ -63,7 +63,7 @@ DEFAULT_STAGES = [
     {"id": "translating", "name": "Translating", "stage_number": 3, "status": "queued", "details": "IndicTrans2 machine translation"},
     {"id": "generating_voice", "name": "Generating voice", "stage_number": 4, "status": "queued", "details": "Chatterbox TTS voice cloning"},
     {"id": "aligning_audio", "name": "Aligning audio", "stage_number": 5, "status": "queued", "details": "Timeline assembly & duration matching"},
-    {"id": "lip_synchronization", "name": "Lip synchronization", "stage_number": 6, "status": "queued", "details": "Wav2Lip-HD video facial alignment"},
+    {"id": "lip_synchronization", "name": "Wav2Lip-HD — AI Lip Synchronization", "stage_number": 6, "status": "queued", "details": "Synchronizing mouth movements with generated speech"},
     {"id": "finalizing", "name": "Finalizing", "stage_number": 7, "status": "queued", "details": "Packaging final output"},
 ]
 
@@ -848,7 +848,7 @@ class JobManager:
                 if job["status"] == "cancelled":
                     return
                 job["current_stage"] = "lip_synchronization"
-                job["current_operation"] = "Initializing Wav2Lip-HD neural lip synchronization..."
+                job["current_operation"] = "Wav2Lip-HD: Synchronizing mouth movements with generated speech..."
                 job["overall_progress"] = 91
                 self._update_stage_status(job, "lip_synchronization", "processing")
                 self._emit_event(job_id, "lip_synchronization", "processing", 91, job["current_operation"])

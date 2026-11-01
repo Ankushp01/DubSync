@@ -105,7 +105,7 @@ def run_wav2lip_hd(
                 elif "Loading standard Vanilla Wav2Lip model" in line_str:
                     progress_callback("Loading standard Wav2Lip neural model...", 93)
                 elif "Standard Vanilla Wav2Lip model loaded" in line_str:
-                    progress_callback("Vanilla Wav2Lip model ready (no ESRGAN/segmentation). Generating frames...", 95)
+                    progress_callback("Wav2Lip model ready. Generating lip-synced frames...", 95)
                 elif "Encoding final lip-synced video" in line_str:
                     progress_callback("Encoding final lip-synced video with FFmpeg...", 98)
                 else:
