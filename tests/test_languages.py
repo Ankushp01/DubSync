@@ -2,6 +2,7 @@
 import unittest
 from fastapi.testclient import TestClient
 
+from api.auth.security import create_access_token
 from api.main import app
 from dubsync.languages import (
     LANGUAGES,
@@ -171,7 +172,8 @@ class LanguageApiEndpointTests(unittest.TestCase):
             "source_language": "en",
             "target_language": "mr",  # Unsupported TTS
         }
-        response = self.client.post("/api/v1/jobs", files=files, data=data)
+        auth_headers = {"Authorization": f"Bearer {create_access_token('usr_lang_test', 'lang@example.com')}"}
+        response = self.client.post("/api/v1/jobs", files=files, data=data, headers=auth_headers)
         self.assertEqual(response.status_code, 422)
         detail = response.json().get("detail", "")
         self.assertIn("Unsupported language pair", detail)
@@ -187,7 +189,8 @@ class LanguageApiEndpointTests(unittest.TestCase):
             "source_language": "en",
             "target_language": "es",
         }
-        response = self.client.post("/api/v1/jobs", files=files, data=data)
+        auth_headers = {"Authorization": f"Bearer {create_access_token('usr_lang_test', 'lang@example.com')}"}
+        response = self.client.post("/api/v1/jobs", files=files, data=data, headers=auth_headers)
         self.assertEqual(response.status_code, 422)
         detail = response.json().get("detail", "")
         self.assertIn("Unsupported language pair", detail)

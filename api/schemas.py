@@ -22,7 +22,8 @@ class StageInfo(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     title: str
-    status: str  # queued, processing, completed, failed, cancelled
+    project_id: Optional[str] = None
+    status: str  # queued, processing, completed, failed, cancelled, interrupted
     current_stage: str
     overall_progress: int  # 0 to 100
     current_operation: str
@@ -39,6 +40,14 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
+class PaginatedJobsResponse(BaseModel):
+    items: List[JobStatusResponse]
+    page: int
+    limit: int
+    total: int
+    total_pages: int
+
+
 class DialogueSegmentResponse(BaseModel):
     index: int
     start: float
@@ -49,9 +58,48 @@ class DialogueSegmentResponse(BaseModel):
     actual_duration: Optional[float] = None
 
 
+class SegmentDetailResponse(BaseModel):
+    segment_id: str
+    segment_index: int
+    start_time: float
+    end_time: float
+    original_text: str
+    translated_text: str = ""
+    raw_tts_duration: float = 0.0
+    adapted_tts_duration: float = 0.0
+    speed_factor: float = 1.0
+    audio_path: Optional[str] = None
+    final_placement_start: float = 0.0
+    final_placement_end: float = 0.0
+    trimming_seconds: float = 0.0
+    status: str = "completed"
+    created_at: Optional[str] = None
+
+
+class EvaluationResponse(BaseModel):
+    evaluation_id: str
+    job_id: str
+    project_id: Optional[str] = None
+    output_id: Optional[str] = None
+    created_at: str
+    video_duration: Optional[float] = None
+    audio_duration: Optional[float] = None
+    video_frame_count: Optional[int] = None
+    frame_rate: Optional[float] = None
+    speech_preservation_percentage: Optional[float] = None
+    trimmed_audio_seconds: Optional[float] = None
+    timeline_extension_seconds: Optional[float] = None
+    lip_sync_metrics: Dict[str, Any] = Field(default_factory=dict)
+    media_integrity: Dict[str, Any] = Field(default_factory=dict)
+    segment_metrics: List[Dict[str, Any]] = Field(default_factory=list)
+    unmeasured_or_null_metrics: Dict[str, Any] = Field(default_factory=dict)
+    warnings: List[str] = Field(default_factory=list)
+
+
 class JobResultResponse(BaseModel):
     job_id: str
     title: str
+    project_id: Optional[str] = None
     status: str
     video_url: Optional[str] = None
     audio_url: Optional[str] = None
