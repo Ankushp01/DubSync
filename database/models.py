@@ -218,6 +218,83 @@ class ProcessingLogModel(BaseModel):
 # =========================================================================
 # Collection 9: processing_jobs
 # =========================================================================
+def resolve_overall_progress(job: Dict[str, Any]) -> int:
+    """Resolve overall progress percentage (0-100) with backward-compatibility fallbacks.
+    
+    Semantics:
+    1. Completed jobs are 100% finished by definition.
+    2. Legitimate recorded progress (> 0) from either 'overall_progress' or 'progress'
+       is preserved and never overwritten for processing, failed, cancelled, or interrupted jobs.
+    3. Queued jobs always resolve to 0%.
+    4. For failed, cancelled, or interrupted jobs without recorded progress (> 0),
+       derive progress from completed stages if available, or preserve 0.
+    5. For actively processing jobs without recorded progress (> 0), derive progress
+       from completed stages or current stage benchmarks (minimum 5%).
+    6. Clamped between 0 and 100.
+    """
+    if not isinstance(job, dict):
+        return 0
+
+    status = str(job.get("status") or "").strip().lower()
+
+    # 1. For completed jobs, derive 100%
+    if status == "completed":
+        return 100
+
+    # 2. Extract legitimate recorded progress from 'overall_progress' or 'progress'
+    recorded: Optional[int] = None
+    for field in ("overall_progress", "progress"):
+        val = job.get(field)
+        if val is not None:
+            try:
+                iv = int(round(float(val)))
+                if 0 <= iv <= 100:
+                    recorded = iv
+                    break
+            except (ValueError, TypeError):
+                pass
+
+    # 3. Queued jobs haven't started yet
+    if status == "queued":
+        return 0
+
+    # 4. If legitimate recorded progress (> 0) exists, strictly preserve it
+    # (prevents overwriting actual recorded progress for processing, failed, cancelled jobs)
+    if recorded is not None and recorded > 0:
+        return recorded
+
+    # 5. Check stages list for completed stage contribution
+    stages = job.get("stages")
+    if isinstance(stages, list) and stages:
+        completed_stages = sum(
+            1 for s in stages
+            if isinstance(s, dict) and str(s.get("status") or "").strip().lower() == "completed"
+        )
+        total_stages = len(stages)
+        if total_stages > 0 and completed_stages > 0:
+            stage_prog = int((completed_stages / total_stages) * 100)
+            return max(0, min(99, stage_prog))
+
+    # 6. For processing jobs without recorded progress or completed stages, estimate from stage benchmarks
+    if status == "processing":
+        stage_benchmarks = {
+            "extracting_audio": 10,
+            "transcribing": 25,
+            "translating": 45,
+            "generating_voice": 65,
+            "aligning_audio": 85,
+            "lip_synchronization": 91,
+            "finalizing": 98,
+        }
+        current_stage = str(job.get("current_stage") or "").strip().lower()
+        if current_stage in stage_benchmarks:
+            return stage_benchmarks[current_stage]
+        return 5  # default minimal non-zero progress for active processing
+
+    # 7. For other unstarted or unrecorded jobs, return recorded (0) if present, else 0
+    return recorded if recorded is not None else 0
+
+
 class ProcessingJobModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -233,6 +310,7 @@ class ProcessingJobModel(BaseModel):
     status: str = "queued"  # queued, processing, completed, failed, cancelled, interrupted
     current_stage: str = "extracting_audio"
     progress: int = 0
+    overall_progress: int = 0
     current_operation: str = "Job queued"
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

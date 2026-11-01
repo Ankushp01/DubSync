@@ -27,7 +27,7 @@ class JobStatusResponse(BaseModel):
     current_stage: str
     overall_progress: int  # 0 to 100
     current_operation: str
-    created_at: str
+    created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     source_language: str

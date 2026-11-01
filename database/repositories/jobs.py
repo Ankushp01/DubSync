@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Optional
 from database.collections import PROCESSING_JOBS_COLLECTION
-from database.models import ProcessingJobModel, utc_now
+from database.models import ProcessingJobModel, resolve_overall_progress, utc_now
 from database.repositories.base import BaseRepository
 
 
@@ -12,9 +12,23 @@ class ProcessingJobsRepository(BaseRepository):
     def __init__(self, db=None):
         super().__init__(PROCESSING_JOBS_COLLECTION, db=db)
 
+    def serialize_job(self, doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Serialize MongoDB job doc and guarantee overall_progress and progress fields."""
+        if not doc:
+            return None
+        res = self.serialize(doc)
+        prog = resolve_overall_progress(res)
+        res["progress"] = prog
+        res["overall_progress"] = prog
+        return res
+
+    def serialize_job_list(self, docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [self.serialize_job(d) for d in docs if d is not None]
+
     async def create_job(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
         col = self.get_collection()
         now = utc_now()
+        prog = resolve_overall_progress(job_data)
         doc = {
             "job_id": job_data["job_id"],
             "project_id": job_data.get("project_id", "default_project"),
@@ -27,7 +41,8 @@ class ProcessingJobsRepository(BaseRepository):
             "voice_mode": job_data.get("voice_mode", "original"),
             "status": job_data.get("status", "queued"),
             "current_stage": job_data.get("current_stage", "extracting_audio"),
-            "progress": int(job_data.get("overall_progress", job_data.get("progress", 0))),
+            "progress": prog,
+            "overall_progress": prog,
             "current_operation": job_data.get("current_operation", "Job queued"),
             "started_at": job_data.get("started_at"),
             "completed_at": job_data.get("completed_at"),
@@ -39,17 +54,17 @@ class ProcessingJobsRepository(BaseRepository):
             "updated_at": now,
         }
         await col.replace_one({"job_id": doc["job_id"]}, doc, upsert=True)
-        return self.serialize(doc)
+        return self.serialize_job(doc)
 
     async def get_by_id(self, job_id: str) -> Optional[Dict[str, Any]]:
         col = self.get_collection()
         doc = await col.find_one({"job_id": job_id})
-        return self.serialize(doc)
+        return self.serialize_job(doc)
 
     async def get_by_id_for_user(self, job_id: str, user_id: str) -> Optional[Dict[str, Any]]:
         col = self.get_collection()
         doc = await col.find_one({"job_id": job_id, "user_id": user_id})
-        return self.serialize(doc)
+        return self.serialize_job(doc)
 
     async def list_jobs(
         self,
@@ -75,7 +90,7 @@ class ProcessingJobsRepository(BaseRepository):
 
         total_pages = math.ceil(total / limit) if total > 0 else 0
         return {
-            "items": self.serialize_list(items),
+            "items": self.serialize_job_list(items),
             "page": page,
             "limit": limit,
             "total": total,
@@ -89,6 +104,15 @@ class ProcessingJobsRepository(BaseRepository):
         clean_updates.pop("_id", None)
         clean_updates["updated_at"] = utc_now()
 
+        # Synchronize progress and overall_progress
+        if "overall_progress" in clean_updates and "progress" not in clean_updates:
+            clean_updates["progress"] = clean_updates["overall_progress"]
+        elif "progress" in clean_updates and "overall_progress" not in clean_updates:
+            clean_updates["overall_progress"] = clean_updates["progress"]
+        elif clean_updates.get("status") == "completed":
+            clean_updates.setdefault("progress", 100)
+            clean_updates.setdefault("overall_progress", 100)
+
         # Prevent completed jobs from accidentally returning to processing
         existing = await col.find_one({"job_id": job_id}, {"status": 1})
         if existing and existing.get("status") in ("completed", "failed", "cancelled"):
@@ -100,7 +124,7 @@ class ProcessingJobsRepository(BaseRepository):
             {"$set": clean_updates},
             return_document=True,
         )
-        return self.serialize(res)
+        return self.serialize_job(res)
 
     async def delete_job(self, job_id: str) -> bool:
         col = self.get_collection()

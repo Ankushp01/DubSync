@@ -27,6 +27,7 @@ from dubsync.stt.whisper import WhisperTranscriber
 from dubsync.video.mux import mux_dubbed_audio
 
 from database.connection import db_manager, run_coro_sync
+from database.models import resolve_overall_progress
 from database.repositories import (
     ProjectsRepository,
     VideosRepository,
@@ -125,7 +126,11 @@ class JobManager:
             try:
                 data = json.loads(REGISTRY_FILE.read_text(encoding="utf-8"))
                 for job in data:
-                    self.jobs[job["job_id"]] = job
+                    if isinstance(job, dict) and "job_id" in job:
+                        prog = resolve_overall_progress(job)
+                        job["overall_progress"] = prog
+                        job["progress"] = prog
+                        self.jobs[job["job_id"]] = job
             except Exception as e:
                 logger.error(f"Failed to load registry: {e}")
 
@@ -152,7 +157,11 @@ class JobManager:
             # 2. Sync database jobs into memory cache
             db_res = await jobs_repo.list_jobs(limit=500)
             for j in db_res.get("items", []):
-                self.jobs[j["job_id"]] = j
+                if isinstance(j, dict) and "job_id" in j:
+                    prog = resolve_overall_progress(j)
+                    j["overall_progress"] = prog
+                    j["progress"] = prog
+                    self.jobs[j["job_id"]] = j
 
             # 3. For any local jobs in registry that are not in DB, sync them into Atlas
             for job_id, local_job in list(self.jobs.items()):
@@ -237,6 +246,7 @@ class JobManager:
             "started_at": None,
             "completed_at": None,
             "current_stage": "extracting_audio",
+            "progress": 0,
             "overall_progress": 0,
             "current_operation": "Job queued for pipeline execution",
             "source_language": source_language,
@@ -327,7 +337,10 @@ class JobManager:
         job["status"] = "cancelled"
         job["current_operation"] = "Pipeline execution cancelled by user"
         self._save_registry()
-        self._emit_event(job_id, "finalizing", "cancelled", job["overall_progress"], "Job cancelled")
+        prog = resolve_overall_progress(job)
+        job["overall_progress"] = prog
+        job["progress"] = prog
+        self._emit_event(job_id, "finalizing", "cancelled", prog, "Job cancelled")
 
         if db_manager.is_connected:
             try:
@@ -414,7 +427,12 @@ class JobManager:
         if not db_manager.is_connected:
             return
         try:
-            run_coro_sync(ProcessingJobsRepository().update_job(job_id, updates))
+            sync_updates = dict(updates)
+            if "overall_progress" in sync_updates and "progress" not in sync_updates:
+                sync_updates["progress"] = sync_updates["overall_progress"]
+            elif "progress" in sync_updates and "overall_progress" not in sync_updates:
+                sync_updates["overall_progress"] = sync_updates["progress"]
+            run_coro_sync(ProcessingJobsRepository().update_job(job_id, sync_updates))
         except Exception as e:
             logger.debug(f"DB job update skipped: {e}")
 
@@ -930,7 +948,8 @@ class JobManager:
                 },
             )
             self._db_log(job_id, job.get("current_stage", "finalizing"), "failed", {"error": str(exc)}, severity="error", project_id=job.get("project_id"))
-            self._emit_event(job_id, job.get("current_stage", "finalizing"), "failed", job["overall_progress"], str(exc), error=str(exc))
+            prog = resolve_overall_progress(job)
+            self._emit_event(job_id, job.get("current_stage", "finalizing"), "failed", prog, str(exc), error=str(exc))
 
 
 job_manager = JobManager()

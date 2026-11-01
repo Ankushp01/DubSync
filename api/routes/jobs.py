@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -9,7 +11,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from fastapi.responses import StreamingResponse
 
 from api.auth.dependencies import get_current_user, require_verified_user
-from api.job_manager import job_manager, JOBS_DIR
+from api.job_manager import job_manager, JOBS_DIR, DEFAULT_STAGES
 from api.schemas import (
     CreateJobResponse,
     DialogueSegmentResponse,
@@ -20,11 +22,142 @@ from api.schemas import (
     SegmentDetailResponse,
 )
 from database.connection import db_manager
-from database.models import UserModel
+from database.models import UserModel, resolve_overall_progress, utc_now
 from database.repositories.evaluations import EvaluationsRepository
 from database.repositories.segments import SegmentsRepository
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
+
+
+def resolve_created_at(j: Dict[str, Any]) -> Optional[str]:
+    """Resolve job creation timestamp without fabricating current UTC time for historical records.
+
+    Resolution order:
+    1. Direct 'created_at' field (datetime or ISO string).
+    2. MongoDB ObjectId generation_time extracted from '_id' if present.
+    3. Historical timestamps ('started_at' or 'completed_at') if created_at is omitted.
+    4. None (preserves nullability without fabricating current time).
+    """
+    val = j.get("created_at")
+    if isinstance(val, datetime):
+        return val.isoformat()
+    if val:
+        return str(val)
+
+    # Fallback to MongoDB ObjectId timestamp if present
+    raw_id = j.get("_id")
+    if raw_id is not None:
+        if hasattr(raw_id, "generation_time"):
+            try:
+                return raw_id.generation_time.isoformat()
+            except Exception:
+                pass
+        if isinstance(raw_id, str):
+            try:
+                from bson import ObjectId
+                if ObjectId.is_valid(raw_id):
+                    return ObjectId(raw_id).generation_time.isoformat()
+            except Exception:
+                pass
+
+    # Fallback to historical started_at or completed_at
+    for fallback_field in ("started_at", "completed_at"):
+        fallback_val = j.get(fallback_field)
+        if isinstance(fallback_val, datetime):
+            return fallback_val.isoformat()
+        if fallback_val:
+            return str(fallback_val)
+
+    return None
+
+
+def build_job_status_response(j: Dict[str, Any]) -> JobStatusResponse:
+    """Safely construct a JobStatusResponse with backward-compatible schema defaults.
+    
+    Raises:
+        ValueError: If record is not a dict or lacks a valid job identifier ('job_id' or '_id').
+    """
+    if not isinstance(j, dict):
+        raise ValueError("Invalid job record: expected dictionary")
+
+    raw_id = j.get("job_id") or j.get("_id")
+    if not raw_id or not str(raw_id).strip():
+        raise ValueError("Invalid job record: missing required identifier ('job_id' or '_id')")
+    job_id = str(raw_id).strip()
+
+    status = str(j.get("status") or "queued")
+    prog = resolve_overall_progress(j)
+
+    # Normalize stages
+    raw_stages = j.get("stages")
+    stages: List[Dict[str, Any]] = []
+    if isinstance(raw_stages, list) and len(raw_stages) > 0:
+        for idx, s in enumerate(raw_stages, start=1):
+            if isinstance(s, dict):
+                stages.append({
+                    "id": str(s.get("id") or f"stage_{idx}"),
+                    "name": str(s.get("name") or f"Stage {idx}"),
+                    "stage_number": int(s.get("stage_number") or idx),
+                    "status": str(s.get("status") or ("completed" if status == "completed" else "queued")),
+                    "duration_seconds": float(s["duration_seconds"]) if s.get("duration_seconds") is not None else None,
+                    "details": s.get("details"),
+                })
+    else:
+        for s in DEFAULT_STAGES:
+            stage_copy = dict(s)
+            if status == "completed":
+                stage_copy["status"] = "completed"
+            stages.append(stage_copy)
+
+    # Format timestamp strings safely (preserves nullability without fabricating current time)
+    created_at_str = resolve_created_at(j)
+
+    started_at_val = j.get("started_at")
+    started_at_str = (
+        started_at_val.isoformat()
+        if isinstance(started_at_val, datetime)
+        else (str(started_at_val) if started_at_val else None)
+    )
+
+    completed_at_val = j.get("completed_at")
+    completed_at_str = (
+        completed_at_val.isoformat()
+        if isinstance(completed_at_val, datetime)
+        else (str(completed_at_val) if completed_at_val else None)
+    )
+
+    dur = j.get("duration_seconds")
+    if dur is not None:
+        try:
+            dur = float(dur)
+        except (ValueError, TypeError):
+            dur = None
+
+    title = str(j.get("title") or job_id or "Untitled Dubbing Job")
+    current_stage = str(j.get("current_stage") or ("finalizing" if status == "completed" else "extracting_audio"))
+    current_op = str(j.get("current_operation") or ("Dubbing completed successfully" if status == "completed" else "Job queued"))
+
+    return JobStatusResponse(
+        job_id=job_id,
+        title=title,
+        project_id=j.get("project_id"),
+        status=status,
+        current_stage=current_stage,
+        overall_progress=prog,
+        current_operation=current_op,
+        created_at=created_at_str,
+        started_at=started_at_str,
+        completed_at=completed_at_str,
+        source_language=str(j.get("source_language") or "en"),
+        detected_source_language=j.get("detected_source_language"),
+        target_language=str(j.get("target_language") or "hi"),
+        duration_seconds=dur,
+        enable_lip_sync=bool(j.get("enable_lip_sync", True)),
+        voice_mode=str(j.get("voice_mode") or "original"),
+        stages=stages,
+        error=j.get("error"),
+    )
 
 
 @router.post("", response_model=CreateJobResponse, status_code=status.HTTP_201_CREATED)
@@ -106,29 +239,12 @@ async def list_jobs(
 ):
     """List all projects/jobs, optionally paginated or filtered by project."""
     jobs = job_manager.list_jobs(project_id=project_id, user_id=current_user.user_id)
-    items = [
-        JobStatusResponse(
-            job_id=j["job_id"],
-            title=j["title"],
-            project_id=j.get("project_id"),
-            status=j["status"],
-            current_stage=j["current_stage"],
-            overall_progress=j["overall_progress"],
-            current_operation=j["current_operation"],
-            created_at=j["created_at"],
-            started_at=j.get("started_at"),
-            completed_at=j.get("completed_at"),
-            source_language=j["source_language"],
-            detected_source_language=j.get("detected_source_language"),
-            target_language=j["target_language"],
-            duration_seconds=j.get("duration_seconds"),
-            enable_lip_sync=j.get("enable_lip_sync", True),
-            voice_mode=j.get("voice_mode", "original"),
-            stages=j["stages"],
-            error=j.get("error"),
-        )
-        for j in jobs
-    ]
+    items: List[JobStatusResponse] = []
+    for j in jobs:
+        try:
+            items.append(build_job_status_response(j))
+        except (ValueError, TypeError) as err:
+            logger.warning("Skipping invalid job document: %s; error: %s", j, err)
 
     if page is not None:
         p = max(1, page)
@@ -155,26 +271,14 @@ async def get_job(job_id: str, current_user: UserModel = Depends(get_current_use
     if not j:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    return JobStatusResponse(
-        job_id=j["job_id"],
-        title=j["title"],
-        project_id=j.get("project_id"),
-        status=j["status"],
-        current_stage=j["current_stage"],
-        overall_progress=j["overall_progress"],
-        current_operation=j["current_operation"],
-        created_at=str(j["created_at"]),
-        started_at=str(j["started_at"]) if j.get("started_at") else None,
-        completed_at=str(j["completed_at"]) if j.get("completed_at") else None,
-        source_language=j["source_language"],
-        detected_source_language=j.get("detected_source_language"),
-        target_language=j["target_language"],
-        duration_seconds=j.get("duration_seconds"),
-        enable_lip_sync=j.get("enable_lip_sync", True),
-        voice_mode=j.get("voice_mode", "original"),
-        stages=j["stages"],
-        error=j.get("error"),
-    )
+    try:
+        return build_job_status_response(j)
+    except ValueError as err:
+        logger.error("Job record corrupted for job_id %s: %s", job_id, err)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Corrupted job record: {err}",
+        )
 
 
 @router.get("/{job_id}/segments", response_model=List[SegmentDetailResponse])
@@ -214,7 +318,8 @@ async def get_job_segments(job_id: str, current_user: UserModel = Depends(get_cu
             pass
 
     # 2. Local fallback from job directory artifacts
-    output_dir = Path(j["output_dir"])
+    output_dir_str = j.get("output_dir") or str(JOBS_DIR / (j.get("job_id") or job_id) / "output")
+    output_dir = Path(output_dir_str)
     stage2_file = output_dir / "stage2_translation.json"
     timing_file = output_dir / "timing_accounting.json"
 
@@ -302,7 +407,8 @@ async def get_job_evaluation(job_id: str, current_user: UserModel = Depends(get_
             pass
 
     # 2. Local fallback from evaluation_summary.json or timing_accounting.json
-    output_dir = Path(j["output_dir"])
+    output_dir_str = j.get("output_dir") or str(JOBS_DIR / (j.get("job_id") or job_id) / "output")
+    output_dir = Path(output_dir_str)
     eval_summary_file = output_dir / "evaluation" / "evaluation_summary.json"
     if eval_summary_file.is_file():
         try:
@@ -360,11 +466,11 @@ async def stream_job_events(job_id: str, current_user: UserModel = Depends(get_c
     async def event_generator():
         # First emit initial state
         initial_event = {
-            "job_id": job_id,
-            "stage": job["current_stage"],
-            "status": job["status"],
-            "progress": job["overall_progress"],
-            "message": job["current_operation"],
+            "job_id": str(job.get("job_id") or job_id),
+            "stage": str(job.get("current_stage") or "extracting_audio"),
+            "status": str(job.get("status") or "queued"),
+            "progress": resolve_overall_progress(job),
+            "message": str(job.get("current_operation") or "Job queued"),
             "error": job.get("error"),
         }
         yield f"data: {json.dumps(initial_event)}\n\n"
@@ -403,7 +509,8 @@ async def get_job_result(job_id: str, current_user: UserModel = Depends(get_curr
     if not j:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    output_dir = Path(j["output_dir"])
+    output_dir_str = j.get("output_dir") or str(JOBS_DIR / (j.get("job_id") or job_id) / "output")
+    output_dir = Path(output_dir_str)
     dialogue_segments: List[DialogueSegmentResponse] = []
 
     # Parse stage 1 and stage 2 JSON artifacts if present
@@ -447,24 +554,37 @@ async def get_job_result(job_id: str, current_user: UserModel = Depends(get_curr
             pass
 
     artifacts = j.get("artifacts", {})
+    completed_at_val = j.get("completed_at")
+    completed_at_str = (
+        completed_at_val.isoformat()
+        if isinstance(completed_at_val, datetime)
+        else (str(completed_at_val) if completed_at_val else None)
+    )
+    dur = j.get("duration_seconds")
+    if dur is not None:
+        try:
+            dur = float(dur)
+        except (ValueError, TypeError):
+            dur = None
+
     return JobResultResponse(
-        job_id=j["job_id"],
-        title=j["title"],
+        job_id=str(j.get("job_id") or j.get("_id") or job_id),
+        title=str(j.get("title") or j.get("job_id") or "Untitled Dubbing Job"),
         project_id=j.get("project_id"),
-        status=j["status"],
+        status=str(j.get("status") or "completed"),
         video_url=artifacts.get("dubbed_video_url"),
         audio_url=artifacts.get("dubbed_audio_url"),
         original_video_url=artifacts.get("original_video_url"),
         transcript_url=artifacts.get("transcript_json_url"),
         translation_url=artifacts.get("translation_json_url"),
-        source_language=j["source_language"],
+        source_language=str(j.get("source_language") or "en"),
         detected_source_language=j.get("detected_source_language"),
-        target_language=j["target_language"],
-        duration_seconds=j.get("duration_seconds"),
-        voice_mode=j.get("voice_mode", "original"),
-        enable_lip_sync=j.get("enable_lip_sync", True),
+        target_language=str(j.get("target_language") or "hi"),
+        duration_seconds=dur,
+        voice_mode=str(j.get("voice_mode") or "original"),
+        enable_lip_sync=bool(j.get("enable_lip_sync", True)),
         dialogue_segments=dialogue_segments,
-        completed_at=j.get("completed_at"),
+        completed_at=completed_at_str,
     )
 
 
@@ -475,10 +595,11 @@ async def get_job_metrics(job_id: str, current_user: UserModel = Depends(get_cur
     if not j:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    output_dir = Path(j["output_dir"])
+    output_dir_str = j.get("output_dir") or str(JOBS_DIR / (j.get("job_id") or job_id) / "output")
+    output_dir = Path(output_dir_str)
     metrics_data: Dict[str, Any] = {
         "job_id": job_id,
-        "status": j["status"],
+        "status": str(j.get("status") or "unknown"),
     }
 
     s3_metrics = output_dir / "evaluation" / "stage3_metrics.json"
