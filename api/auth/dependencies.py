@@ -98,6 +98,19 @@ async def get_current_user(
         )
 
 
+async def require_verified_user(
+    current_user: UserModel = Depends(get_current_user),
+) -> UserModel:
+    """Ensure the user is authenticated and has verified their email address."""
+    if not current_user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="EMAIL_NOT_VERIFIED: Email verification is required to perform this action. Please check your inbox or resend verification.",
+            headers={"X-Auth-Reason": "email_unverified"},
+        )
+    return current_user
+
+
 async def get_optional_current_user(
     request: Request,
     authorization: Optional[str] = Header(None),

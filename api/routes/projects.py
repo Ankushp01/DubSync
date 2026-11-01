@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from api.auth.dependencies import get_current_user
+from api.auth.dependencies import get_current_user, require_verified_user
 from database.connection import db_manager, DatabaseUnavailableError
 from database.models import UserModel
 from database.repositories.projects import ProjectsRepository

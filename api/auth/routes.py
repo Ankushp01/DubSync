@@ -41,7 +41,7 @@ async def register(
     """Register a new user account with Argon2id password hashing."""
     ip = _get_client_ip(request)
     ua = request.headers.get("User-Agent")
-    user, access_token, refresh_token, csrf_token, verify_token = await service.register(req, user_agent=ua, ip_address=ip)
+    user, access_token, refresh_token, csrf_token, verify_token, delivery = await service.register(req, user_agent=ua, ip_address=ip)
     set_auth_cookies(response, access_token=access_token, refresh_token=refresh_token, csrf_token=csrf_token)
     return AuthResponse(
         user=user,
@@ -49,6 +49,8 @@ async def register(
         token_type="bearer",
         expires_in=900,
         preview_verification_token=verify_token,
+        email_sent=delivery.success if delivery else False,
+        delivery_status="sent" if (delivery and delivery.success) else ((delivery.error_code or "delivery_failed") if delivery else "not_configured"),
     )
 
 
@@ -152,11 +154,31 @@ async def verify_email(
 @router.post("/resend-verification", response_model=MessageResponse)
 async def resend_verification(
     req: ResendVerificationRequest,
+    request: Request,
     service: AuthService = Depends(get_auth_service),
 ):
-    """Resend email verification token."""
-    await service.resend_verification(req.email)
-    return MessageResponse(message="If an account exists, a new verification link has been sent.")
+    """Resend email verification token with rate limiting."""
+    ip = _get_client_ip(request)
+    delivery = await service.resend_verification(req.email, ip_address=ip)
+    if delivery:
+        if delivery.success:
+            return MessageResponse(
+                message="A new verification email has been sent to your address.",
+                status="sent",
+                delivery_status="sent",
+            )
+        else:
+            return MessageResponse(
+                message=f"Verification email could not be sent: {delivery.error_message}",
+                status="delivery_failed",
+                delivery_status=delivery.error_code or "failed",
+                error_details=delivery.error_message,
+            )
+    return MessageResponse(
+        message="If an unverified account exists for this email, a new verification link has been sent.",
+        status="sent",
+        delivery_status="sent",
+    )
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

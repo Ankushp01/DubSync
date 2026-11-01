@@ -65,65 +65,7 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 
 
-# =========================================================================
-# Email Service Abstraction
-# =========================================================================
-class EmailService:
-    def __init__(self):
-        self.smtp_host = os.getenv("SMTP_HOST")
-        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        self.smtp_user = os.getenv("SMTP_USER")
-        self.smtp_pass = os.getenv("SMTP_PASS")
-        self.smtp_from = os.getenv("SMTP_FROM", "noreply@dubsync.ai")
-        self.frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-    @property
-    def is_configured(self) -> bool:
-        return bool(self.smtp_host and self.smtp_user and self.smtp_pass)
-
-    def send_verification_email(self, email: str, token: str):
-        verify_url = f"{self.frontend_url}/verify-email?token={token}"
-        if not self.is_configured:
-            logger.info(
-                f"[EmailService] Verification token generated for '{email}'. "
-                f"SMTP not configured in environment. In dev/testing, token is stored on user record."
-            )
-            return
-
-        subject = "Verify your DubSync account"
-        text_content = f"Please verify your DubSync account by clicking: {verify_url}\nThis link expires in 24 hours."
-        self._send_email(email, subject, text_content)
-
-    def send_password_reset_email(self, email: str, token: str):
-        reset_url = f"{self.frontend_url}/reset-password?token={token}"
-        if not self.is_configured:
-            logger.info(
-                f"[EmailService] Password reset token generated for '{email}'. "
-                f"SMTP not configured in environment. In dev/testing, token is stored on user record."
-            )
-            return
-
-        subject = "Reset your DubSync password"
-        text_content = f"You requested a password reset. Click this link to set a new password: {reset_url}\nThis link expires in 1 hour."
-        self._send_email(email, subject, text_content)
-
-    def _send_email(self, to_email: str, subject: str, content: str):
-        try:
-            msg = MIMEMultipart()
-            msg["From"] = self.smtp_from
-            msg["To"] = to_email
-            msg["Subject"] = subject
-            msg.attach(MIMEText(content, "plain"))
-
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
-                server.starttls()
-                server.login(self.smtp_user, self.smtp_pass)
-                server.send_message(msg)
-        except Exception as e:
-            logger.warning(f"[EmailService] Failed to deliver email to {to_email}: {e}")
-
-
-email_service = EmailService()
+from api.auth.email import DeliveryResult, email_service
 
 
 # =========================================================================
@@ -186,8 +128,8 @@ class AuthService:
         )
         await self.users_repo.set_verification_token(user_doc["user_id"], verify_token_hash, verify_expires)
 
-        # 8. Send verification email
-        email_service.send_verification_email(normalized_email, raw_verify_token)
+        # 8. Send verification email via Resend
+        delivery = await email_service.send_verification_email(normalized_email, raw_verify_token)
 
         # 9. Create session and issue tokens immediately
         raw_refresh_token = generate_random_token(48)
@@ -221,7 +163,7 @@ class AuthService:
             created_at=str(user_doc["created_at"]),
             preferences=user_doc.get("preferences", {}),
         )
-        return user_response, access_token, raw_refresh_token, csrf_token, raw_verify_token
+        return user_response, access_token, raw_refresh_token, csrf_token, raw_verify_token, delivery
 
     async def login(
         self,
@@ -434,7 +376,7 @@ class AuthService:
             token_hash = hash_token(raw_token)
             expires = utc_now() + timedelta(hours=1)
             await self.users_repo.set_reset_token(user["user_id"], token_hash, expires)
-            email_service.send_password_reset_email(normalized_email, raw_token)
+            await email_service.send_password_reset_email(normalized_email, raw_token)
             return raw_token
         return None
 
@@ -468,13 +410,24 @@ class AuthService:
             )
         return True
 
-    async def resend_verification(self, email: str):
-        """Resend email verification token without leaking account existence."""
+    async def resend_verification(self, email: str, ip_address: Optional[str] = None) -> Optional[DeliveryResult]:
+        """Resend email verification token with rate limiting and secure enumeration prevention."""
         normalized_email = email.strip().lower()
+
+        # Rate limit: 3 requests per 10 minutes per email or IP
+        rate_key = f"resend_{ip_address or 'anon'}_{normalized_email}"
+        if not rate_limiter.check_rate_limit(rate_key, max_attempts=3, window_seconds=600):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many verification requests. Please wait a few minutes before trying again.",
+            )
+
         user = await self.users_repo.get_by_email(normalized_email)
         if user and not user.get("email_verified", False):
             raw_token = generate_random_token(32)
             token_hash = hash_token(raw_token)
             expires = utc_now() + timedelta(hours=24)
             await self.users_repo.set_verification_token(user["user_id"], token_hash, expires)
-            email_service.send_verification_email(normalized_email, raw_token)
+            delivery = await email_service.send_verification_email(normalized_email, raw_token)
+            return delivery
+        return None

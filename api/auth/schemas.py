@@ -59,6 +59,8 @@ class AuthResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int = 900
     preview_verification_token: Optional[str] = None
+    email_sent: Optional[bool] = None
+    delivery_status: Optional[str] = None
 
 
 class UpdateUserRequest(BaseModel):
@@ -103,3 +105,5 @@ class MessageResponse(BaseModel):
     message: str
     status: Optional[str] = None
     success: bool = True
+    delivery_status: Optional[str] = None
+    error_details: Optional[str] = None

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 
-from api.auth.dependencies import get_current_user
+from api.auth.dependencies import get_current_user, require_verified_user
 from api.job_manager import job_manager, JOBS_DIR
 from api.schemas import (
     CreateJobResponse,
@@ -39,7 +39,7 @@ async def create_job(
     speech_speed: float = Form(1.0),
     enable_lip_sync: bool = Form(True),
     output_quality: str = Form("high"),
-    current_user: UserModel = Depends(get_current_user),
+    current_user: UserModel = Depends(require_verified_user),
 ):
     """Create and start a real dubbing pipeline job with optional project association."""
     if not video.filename:
